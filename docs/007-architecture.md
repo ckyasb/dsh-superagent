@@ -545,7 +545,7 @@ Each Executor has six application tools:
 
 A hand-back returns `queued: false` if another Ticket still owns the message, or this Ticket never owned it. For example, a bot message went to Eval independently.
 
-The worker preset is defined in `cordis.patch.yml` and selected through `WORKER_PRESET`. `WORK_TOOLS` in `src/app/sessions.ts` retains available file, search, shell, job, web, skill, todo and subagent tools. Workers do not receive tools for asking or presenting to a person, changing the profile, scheduling work outside worker slots, starting or messaging other Sessions, or editing external documents. Tool calls are refused after the Ticket ends.
+The worker preset is defined in `cordis.patch.yml` and selected through `WORKER_PRESET`. `WORK_TOOLS` in `src/app/sessions.ts` retains available file, search, shell, job, web, skill, todo and subagent tools. The deployment's `extraWorkTools` (`extraWorkTools` in `src/deployment.ts`) extends this list at Session decoration time with exact names or `*`-prefixed matches among the tools the Executor Session can see — such as `exit_plan_mode` or MCP tools — and its subagents get the same extended list. Workers do not receive tools for asking or presenting to a person, changing the profile, scheduling work outside worker slots, starting or messaging other Sessions, or editing external documents, unless `extraWorkTools` names them. Tool calls are refused after the Ticket ends.
 
 ### Result shapes and assessment context
 

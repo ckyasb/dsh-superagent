@@ -47,6 +47,8 @@ let sections: Map<string, Section>
 type Guard = (execution?: { name: string; arguments: unknown }) => string | undefined
 let guards: Map<string, Guard>
 let restricts: Map<string, unknown[]>
+/** Extra tools the stand-in tools service reports as inherited besides the base preset tools, for `extraWorkTools` tests. */
+let extraVisible: string[]
 type HttpHandler = (req: unknown, res: unknown) => Promise<void>
 let http: HttpHandler
 async function api(method: string, path: string): Promise<{ status: number; body: unknown }> {
@@ -161,6 +163,7 @@ beforeEach(async () => {
   sections = new Map()
   guards = new Map()
   restricts = new Map()
+  extraVisible = []
   deliveries = vi.fn()
   controller = {
     create: vi.fn(async ({ sessionId, agentPreset }) => {
@@ -168,7 +171,8 @@ beforeEach(async () => {
       const agentCtx = new Context()
       const preset = {}
       const inherited = ['bash', 'read', 'read_image', 'skill', 'job_output', 'job_list', 'job_kill', 'grep', 'web_search',
-        'ask_user_question', 'plugin_manager', 'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit']
+        'ask_user_question', 'plugin_manager', 'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit',
+        ...extraVisible]
       const sessionTools = new Map<string, RegisteredTool>()
       tools.set(sessionId, sessionTools)
       agentCtx.reflect.provide('tools', { register: (tool: RegisteredTool) => { sessionTools.set(tool.name,
@@ -177,6 +181,11 @@ beforeEach(async () => {
         get: (name: string, scope?: object) => {
           const own = scope === agents.get(sessionId)
           return (scope === preset || own) && inherited.includes(name) || own && name === 'subagent' ? { name } : undefined
+        },
+        // The names one scope sees: the preset's tools for a parent scope, plus the agent's own ones for the agent itself.
+        schemas: (scope?: object) => {
+          const own = scope === agents.get(sessionId)
+          return [...(scope === undefined || scope === preset || own ? inherited : []), ...(own ? ['subagent'] : [])].map(name => ({ name }))
         },
         restrict: vi.fn((rule: { allow: string[] }) => {
           if (rule.allow.some(name => !inherited.includes(name))) throw new Error('Restriction names a non-inherited tool')
@@ -1772,6 +1781,34 @@ it('gives a subagent of a worker\'s subagent the same work tools and guard', asy
   expect(restricts.get('grandchild-1')).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get('grandchild-1')!()).toBe('Ticket ended; new work needs a new authorized ticket')
+})
+
+it('extends a worker\'s and its subagents\' tools with the visible extra work tools, read without a restart', async () => {
+  (runtime.machine.extraWorkTools as unknown as { set(next: string[]): void })
+    .set(['exit_plan_mode', 'mcp__*', 'ask_user_question', 'subagent', 'nobody__*'])
+  extraVisible = ['exit_plan_mode', 'mcp__acme__search', 'ask_user_question']
+  const { ticket, sessionId } = await acceptedTicket()
+  // The exact visible names and the prefix-matched MCP tool are added, even a profile tool like ask_user_question the
+  // deployment named; the configured name the agent cannot see (`nobody__x`) and the agent's own `subagent` are not.
+  const allow = ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill', 'exit_plan_mode',
+    'mcp__acme__search', 'ask_user_question']
+  expect(restricts.get(sessionId)).toEqual([{ allow }])
+  const create = controller.create as (options: { sessionId: string }) => Promise<void>
+  await create({ sessionId: 'child-extra' })
+  const child = agents.get('child-extra')! as unknown as { session: { header: { parentSession?: string } } }
+  child.session.header = { parentSession: sessionId }
+  await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: child } as never)
+  expect(restricts.get('child-extra')).toEqual([{ allow }])
+  // Changing the configuration applies to the next decorated Session without a restart: an emptied list binds the plain list.
+  void (runtime.machine.extraWorkTools as unknown as { set(next: string[]): void }).set([])
+  await create({ sessionId: 'child-plain' })
+  const plain = agents.get('child-plain')! as unknown as { session: { header: { parentSession?: string } } }
+  plain.session.header = { parentSession: sessionId }
+  await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: plain } as never)
+  expect(restricts.get('child-plain')).toEqual([{ allow: allow.slice(0, 9) }])
+  runtime.engine.stopTicket(ticket.id)
+  expect(guards.get(sessionId)!()).toBe('Ticket ended; new work needs a new authorized ticket')
+  expect(guards.get('child-extra')!()).toBe('Ticket ended; new work needs a new authorized ticket')
 })
 
 it('gives the Assignment a restart starts the messages the replaced one had delivered but no step took, once', async () => {

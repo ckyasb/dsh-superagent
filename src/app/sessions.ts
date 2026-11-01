@@ -34,6 +34,8 @@ export interface SessionsHost {
   closing(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
+  /** Tools an Executor Session may use besides the built-in work tools: exact names, or prefixes ending in `*`. */
+  extraWorkTools(): readonly string[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
   tools(agent: Agent, ticket?: Ticket): Tool[]
 }
@@ -281,19 +283,49 @@ export class Sessions {
     } catch { return false }
   }
   /**
-   * An Executor Session's tools: only the profile's work tools, which DSH requires to be known, and none once its ticket
-   * ended. A failed or blocked worker keeps its tools, so a person may continue it in its Session; only automated input waits
-   * (see the executor). Read inherited tools through the parent scope, which includes the preset's tools. The global view
-   * misses preset tools; the agent's own view also includes local tools such as subagent, which restrict refuses to name.
+   * An Executor Session's tools: only the profile's work tools plus the visible tools `extraWorkTools` matches, which DSH
+   * requires to be known, and none once its ticket ended. A failed or blocked worker keeps its tools, so a person may
+   * continue it in its Session; only automated input waits (see the executor). Read inherited tools through the parent
+   * scope, which includes the preset's tools. The global view misses preset tools; the agent's own view also includes
+   * local tools such as subagent, which restrict refuses to name — an extra entry only reaches inherited tools.
+   *
+   * The list is evaluated when the Session is decorated: an MCP tool registered afterwards reaches the Executor Sessions
+   * created from then on, and running ones keep what they were bound with.
    */
   private workOnly(agent: Agent, ticketId: string): (() => void)[] {
     const store = this.host.store
     const parent = scopeParentOf(agent)
-    const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
+    const allow = this.workTools(agent, parent)
     return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
       const current = store.tickets.get(ticketId)
       return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
     })]
+  }
+  /**
+   * The tools an Executor Session may call: the built-in work tools it can see, extended by the `extraWorkTools` the
+   * deployment configured, read when this runs. An entry is an exact tool name — visible to the agent through its parent
+   * scope — or a prefix ending in `*`, such as `mcp__*`, which matches the tools DSH's tools service lists as inherited;
+   * the tools registered on the agent's own scope stay excluded, since restrict cannot name them. A prefix entry that
+   * matches nothing, and a name the agent cannot see, simply add nothing.
+   */
+  private workTools(agent: Agent, parent: object | undefined): string[] {
+    const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
+    const extras = this.host.extraWorkTools()
+    if (extras.length === 0) return allow
+    const known = new Set(allow)
+    // Prefix entries match the tools the agent inherits from its parent scope (the preset's, plus globally registered
+    // ones); the tools registered on its own scope are not inherited, and restrict refuses to name them.
+    const inherited = agent.ctx.tools.schemas(parent).map(tool => tool.name)
+    const added: string[] = []
+    for (const extra of extras) {
+      const prefix = extra.endsWith('*') ? extra.slice(0, -1) : undefined
+      for (const name of prefix === undefined ? [extra] : inherited) {
+        if ((prefix === undefined ? agent.ctx.tools.get(name, parent) !== undefined : name.startsWith(prefix)) && !known.has(name)) {
+          known.add(name); added.push(name)
+        }
+      }
+    }
+    return [...allow, ...added]
   }
   /**
    * A subagent of an Executor Session, or of one of its subagents, which runs under DSH's `standard` preset with the worker's
