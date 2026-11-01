@@ -8,7 +8,7 @@ import { USER_ERRORS, UserError } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import { SettingsSchema, policyVersion } from '../src/policy.ts'
 import { guides, handoffPolicy, mainAdmissionPolicy, masterPrompt, sharedPrompt, workerPrompt } from '../src/app/context.ts'
-import { promptFile } from '../src/app/skill-files.ts'
+import { bundledSkills, promptFile } from '../src/app/skill-files.ts'
 import { packagePath } from '../src/infra/paths.ts'
 import type { Variable } from '../src/app/execution-environment.ts'
 
@@ -112,7 +112,7 @@ it('lists a ticket\'s execution environment in its prompt, and says setup is inc
   })
 })
 
-it('registers the built-in Source skills, Feishu only with a Feishu bot, before the team skills', () => {
+it('registers the built-in Source skills, each only when its Source is configured, before the team skills', () => {
   withStore(store => {
     const config = { ...defaultPrompts(), skills: { release: 'Tag releases.' } }
     const skills = promptsOf(store).skills(config)
@@ -120,6 +120,22 @@ it('registers the built-in Source skills, Feishu only with a Feishu bot, before 
     expect(skills[1]![1]).toContain('## CLI usage')
     expect(skills[2]![1]).toBe('Tag releases.')
     expect(new Prompts(store, () => 100000, variables, () => false).skills(config).map(([name]) => name)).toEqual(['github', 'release'])
+    expect(new Prompts(store, () => 100000, variables, () => false, () => false, () => true).skills(config).map(([name]) => name))
+      .toEqual(['gitlab', 'release'])
+    expect(new Prompts(store, () => 100000, variables, () => true, () => true, () => true).skills(config).map(([name]) => name))
+      .toEqual(['feishu', 'github', 'gitlab', 'release'])
+    // Before setup finished, GitHub stays registered as before, and GitLab is not.
+    expect(new Prompts(store, () => 100000, () => undefined, () => false).skills(config).map(([name]) => name)).toEqual(['github', 'release'])
+  })
+})
+
+it('loads the bundled GitLab skill with its frontmatter, and lets a team override it as skill/gitlab', () => {
+  expect(bundledSkills.gitlab).toMatchObject({ name: 'dsh-superagent-gitlab', description: expect.stringMatching(/^Read GitLab /) })
+  expect(bundledSkills.gitlab.content).toContain('gitlab/merge_requests/<iid>')
+  withStore(store => {
+    const prompts = new Prompts(store, () => 100000, variables, () => false, () => true, () => true)
+    const edited = prompts.validate({ ...defaultPrompts(), overrides: { 'skill/gitlab': { text: 'GitLab, the team way.' } } })
+    expect(prompts.skills(edited)).toContainEqual(['gitlab', 'GitLab, the team way.'])
   })
 })
 

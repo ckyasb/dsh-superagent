@@ -181,7 +181,7 @@ Setup must succeed before polling or work starts. Overview lists missing require
    ```
 
    List personal CLIs, such as one signed in to your own account, as blocked commands.
-4. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
+4. **Prompts.** Set the team sections: the disclosure line, review bots, the commit author and the auto-merge condition. On a GitLab deployment the disclosure line applies to MR comments and descriptions too, and the default delivery section tells the agents never to merge; keep that or name a person who merges.
 
 ### Management API
 
