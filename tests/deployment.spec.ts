@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Config, executable, machineOf, resolveDeployment, resolveFeishuBot, type Machine, type Probe } from '../src/deployment.ts'
+import { Config, executable, machineOf, resolveFeishuBot, resolveGithub, resolveGitlab, type Machine, type Probe } from '../src/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
 
 const exec = promisify(execFile)
@@ -21,6 +21,9 @@ const machine = (overrides: Partial<Machine> = {}): Machine => ({ ...machineOf(C
 /** Runs commands like worker shells do, but locally: the stand-ins first on PATH, then the system's git. */
 const probe: Probe = async argv => (await exec(argv[0]!, argv.slice(1), { env: { PATH: path, HOME: dir } })).stdout
 const setupError = (place: string, code: string, values: Record<string, unknown> = {}) => expect.objectContaining({ place, code, values: expect.objectContaining(values) })
+/** Fake glab wrapper answering `api user` with `user` and every project read with `project`. */
+const glab = (file: string, user: object, project: object): string =>
+  program(file, `case "$*" in\n  "api user") echo '${JSON.stringify(user)}' ;;\n  "api projects/"*) echo '${JSON.stringify(project)}' ;;\n  *) exit 1 ;;\nesac`)
 
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'deployment-'))
@@ -58,16 +61,16 @@ describe('configuration schema', () => {
 
 describe('setup', () => {
   it('reads the repository from the GitHub Source and the accounts from their CLIs, skipping the worker shims', async () => {
-    const deployment = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, probe, path)
-    expect(deployment).toMatchObject({ repository: 'acme/widgets', github: { cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' } })
-    expect(deployment.github).toEqual({ cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' })
-    expect(deployment).not.toHaveProperty('feishu')
+    const account = await resolveGithub(machine(), { repository: 'acme/widgets', cli: 'gh' }, probe, path)
+    expect(account).toEqual({ cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com', repository: 'acme/widgets' })
     // A renamed repository is still resolved by its old name; notifications carry GitHub's current full_name.
-    expect((await resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path)).repository).toBe('acme/widgets')
+    expect((await resolveGithub(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path))!.repository).toBe('acme/widgets')
+    // A configuration that names neither a repository nor a CLI is unconfigured, not broken.
+    expect(await resolveGithub(machine(), {}, probe, path)).toBeUndefined()
   })
   it('names what setup needs and where it is set', async () => {
     const needs = (place: string, code: string, values: Record<string, unknown>, github: unknown) =>
-      expect(resolveDeployment(machine(), github, probe, path)).rejects.toEqual(setupError(place, code, values))
+      expect(resolveGithub(machine(), github, probe, path)).rejects.toEqual(setupError(place, code, values))
     const repository = 'acme/widgets'
     await needs('github', 'repositoryUnset', {}, { cli: 'gh' })
     await needs('github', 'agentCliUnset', {}, { repository })
@@ -82,6 +85,50 @@ describe('setup', () => {
     await needs('github', 'repositoryUnreadable', { account: 'Agent-Bot', repository: 'acme/widgets', output }, { repository, cli: unreadable })
     await needs('github', 'agentCliNoAccount', {}, { repository, cli: program(join(dir, 'bin', 'gh-anonymous'), `echo '{}'`) })
     expect(() => executable('nothing-here', join(dir, 'bin'))).toThrow('nothing-here is not an executable file on PATH')
+  })
+  it('reads the GitLab account and project from the glab wrapper, taking the project path GitLab returns', async () => {
+    const user = { id: 9, username: 'agent-bot', name: 'Agent Bot' }
+    const project = { id: 42, path_with_namespace: 'acme/widgets', web_url: 'https://git.zju.edu.cn/acme/widgets',
+      default_branch: 'main', permissions: { project_access: null, group_access: { access_level: 30 } } }
+    const cli = glab(join(dir, 'bin', 'glab'), user, project)
+    expect(await resolveGitlab(machine(), { host: 'git.zju.edu.cn', project: 'acme/widgets', cli }, probe, path))
+      .toEqual({ cli: join(dir, 'bin', 'glab'), host: 'git.zju.edu.cn', project: 'acme/widgets', projectId: 42,
+        webUrl: 'https://git.zju.edu.cn/acme/widgets', defaultBranch: 'main', login: 'agent-bot', userId: 9, name: 'Agent Bot',
+        commitEmail: 'agent-bot@noreply.git.zju.edu.cn' })
+    // The commit email prefers the commit email, then the email, then the noreply address of the host.
+    const mailed = { ...user, email: 'bot@example.com' }
+    expect((await resolveGitlab(machine(), { host: 'git.zju.edu.cn', project: 'acme/widgets', cli: glab(join(dir, 'bin', 'glab'), mailed, project) }, probe, path))!.commitEmail).toBe('bot@example.com')
+    const committed = { ...user, email: 'bot@example.com', commit_email: 'bots@example.com' }
+    expect((await resolveGitlab(machine(), { host: 'git.zju.edu.cn', project: 'acme/widgets', cli: glab(join(dir, 'bin', 'glab'), committed, project) }, probe, path))!.commitEmail).toBe('bots@example.com')
+    // A configuration that names neither a host, a project, nor a CLI is unconfigured, not broken.
+    expect(await resolveGitlab(machine(), {}, probe, path)).toBeUndefined()
+  })
+  it('names what the GitLab setup needs and where it is set', async () => {
+    const user = { id: 9, username: 'agent-bot', name: 'Agent Bot' }
+    const project = (access: unknown) => ({ id: 42, path_with_namespace: 'acme/widgets', web_url: 'https://git.zju.edu.cn/acme/widgets',
+      default_branch: 'main', permissions: access })
+    const needs = async (code: string, values: Record<string, unknown>, gitlab: Record<string, unknown>) =>
+      expect(resolveGitlab(machine(), { host: 'git.zju.edu.cn', project: 'acme/widgets', cli: join(dir, 'bin', 'glab'), ...gitlab }, probe, path))
+        .rejects.toEqual(setupError('gitlab', code, values))
+    await needs('gitlabHostUnset', {}, { host: '' })
+    await needs('gitlabProjectUnset', {}, { project: '' })
+    await needs('gitlabCliUnset', {}, { cli: '' })
+    await needs('gitlabCliMissing', { output: `${join(dir, 'missing')} is not an executable file` }, { cli: join(dir, 'missing') })
+    await needs('gitlabCliSignedOut', {}, { cli: program(join(dir, 'bin', 'glab-broken'), 'exit 1') })
+    await needs('gitlabNoAccount', {}, { cli: program(join(dir, 'bin', 'glab-anonymous'), `echo '{}'`) })
+    await needs('gitlabProjectUnreadable', { account: 'agent-bot', project: 'acme/widgets', output: expect.stringContaining('HTTP 404') },
+      { cli: program(join(dir, 'bin', 'glab-outsider'), `case "$*" in
+  "api user") echo '${JSON.stringify(user)}' ;;
+  *) echo 'HTTP 404' >&2; exit 1 ;;
+esac`) })
+    await needs('gitlabProjectUnreported', { project: 'acme/widgets' }, { cli: glab(join(dir, 'bin', 'glab'), user, {}) })
+    // The web address GitLab returns must live on the host the Source names.
+    await needs('gitlabHostMismatch', { host: 'git.zju.edu.cn', actual: 'git.example.com' },
+      { cli: glab(join(dir, 'bin', 'glab'), user, { ...project({ project_access: { access_level: 30 }, group_access: null }), web_url: 'https://git.example.com/acme/widgets' }) })
+    await needs('gitlabProjectReadOnly', { account: 'agent-bot', project: 'acme/widgets' },
+      { cli: glab(join(dir, 'bin', 'glab'), user, project({ project_access: null, group_access: { access_level: 20 } })) })
+    // Developer access through either the project or its group is enough.
+    await expect(resolveGitlab(machine(), { host: 'git.zju.edu.cn', project: 'acme/widgets', cli: glab(join(dir, 'bin', 'glab'), user, project({ project_access: { access_level: 30 }, group_access: null })) }, probe, path)).resolves.toBeDefined()
   })
   it('reads the Feishu bot from a bot-only lark-cli, or finds none when the Feishu Source names no CLI', async () => {
     expect(await resolveFeishuBot(machine(), {}, probe, path)).toBeUndefined()

@@ -96,9 +96,14 @@ function machineView({ stateDir, promptMaxChars, admissionContextMaxPages, admis
 }
 function setupView(runtime: HttpHost) {
   const resolved = runtime.configured() ? runtime.deployment : undefined
+  const { github, gitlab, feishu } = resolved ?? {}
   return {
     machine: machineView(runtime.machine), problem: runtime.setupProblem ?? null, feishuProblem: runtime.feishuProblem ?? null,
-    accounts: resolved ? { repository: resolved.repository, agent: resolved.github.login, feishu: resolved.feishu ? { appId: resolved.feishu.appId, brand: resolved.feishu.brand, botId: resolved.feishu.botId, name: resolved.feishu.name } : null } : null,
+    accounts: resolved ? {
+      repository: github?.repository ?? null, agent: github?.login ?? null,
+      gitlab: gitlab ? { host: gitlab.host, project: gitlab.project, login: gitlab.login, webUrl: gitlab.webUrl } : null,
+      feishu: feishu ? { appId: feishu.appId, brand: feishu.brand, botId: feishu.botId, name: feishu.name } : null,
+    } : null,
   }
 }
 /** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`). */

@@ -46,6 +46,33 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
    Sign in as the agent account; the last command prints its login. dsh-superagent reads the login the same way.
 
+### Agent GitLab account (optional)
+
+dsh-superagent can serve a self-hosted GitLab instead of, or next to, GitHub: the GitHub Source and the GitLab Source are independent, and at least one of them must name a repository.
+
+1. Create a GitLab user, or a project access token, for the agent on your GitLab instance (for example `git.zju.edu.cn`), with the `api`, `read_repository` and `write_repository` scopes, and give the agent the Developer role or higher on the project.
+2. Give it a `glab` wrapper that uses only its own credentials. The host runs `<cli> api <path>` against `https://<host>/api/v4/<path>` to read the account and the project's permissions, and `<cli> auth git-credential get` when the workers' git pushes:
+
+   ```sh
+   mkdir -p ~/.local/bin
+   cat > ~/.local/bin/glab-agent <<'EOF'
+   #!/bin/sh
+   # The token file holds only the agent's token and is readable only by its OS user.
+   GITLAB_HOST=git.zju.edu.cn
+   GITLAB_TOKEN="$(cat "$HOME/.config/glab-agent/token")"
+   export GITLAB_HOST GITLAB_TOKEN
+   exec glab "$@"
+   EOF
+   chmod +x ~/.local/bin/glab-agent
+   printf 'protocol=https\nhost=git.zju.edu.cn\n\n' | glab-agent auth git-credential get
+   ```
+
+   The last command must print `username=…` and `password=<the token>`. `glab` reads `GITLAB_HOST` and `GITLAB_TOKEN`; a wrapper may also sign in with `glab auth login` and a dedicated configuration directory instead of environment variables.
+
+3. On the GitLab card of **Sources**, set `host` (such as `git.zju.edu.cn`), `project` (the full path `group/subgroup/name`), and `cli` (for example `/home/me/.local/bin/glab-agent`). Saving checks the account, that the project lives on that host, and that the account can push to it (Developer or higher), then restarts dsh-superagent.
+
+Workers call the same wrapper as `glab`, and their git pushes to `https://<host>/…` with it as the credential helper.
+
 ### Feishu bot (optional)
 
 1. Create a self-built app with the bot capability. Grant it the permissions to receive message events, read and send chat messages, and read chat members, then publish the app version.
@@ -217,12 +244,12 @@ curl -s -X PUT -H 'x-orchestrator-request: 1' -H 'content-type: application/json
 
 Setup uses the DeepSeek Harness subprocess service, as worker shells do. It removes environment variables whose names contain KEY, PASSWORD, SECRET or TOKEN.
 
-Setup verifies the GitHub repository and the agent's push access, writes the worker environment, and checks that git uses only the agent credentials for github.com. A Feishu setup failure disables only the Feishu Source.
+Setup verifies each configured forge's repository and the agent's push access, writes the worker environment, and checks that git uses only the agent credentials for github.com and for the configured GitLab host. A Feishu setup failure disables only the Feishu Source.
 
 The process environment that setup writes:
 
-- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
-- **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
+- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` and `glab` run the agent's CLIs, failing when their Source is not configured; `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
+- **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects each agent CLI as the credential helper of its host (github.com, and the configured GitLab host), rewrites their SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
 
@@ -256,8 +283,14 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | `The agent GitHub CLI cannot read its account` | Sign the wrapper in with `auth login` |
 | `@… cannot read …` or `@… cannot push to …` | Give the agent account write access to the repository |
 | `The GitHub Source names no repository.` | Set the repository, `owner/name`, on the GitHub card |
+| `Neither the GitHub nor the GitLab Source names a repository.` | Set the repository on the GitHub card, or host, project and CLI on the GitLab card; one of the two is enough |
+| `The GitLab Source names no host.` or `names no project.` or `The agent GitLab CLI is not set.` | Set `host`, `project` and `cli` on the GitLab card |
+| `The agent GitLab CLI was not found.` | Set the wrapper's absolute path, or a command name on `PATH` |
+| `The agent GitLab CLI cannot read its account.` | Sign the wrapper in, or export its `GITLAB_HOST` and `GITLAB_TOKEN` |
+| `@… cannot read …` or `@… cannot push to …; give it the Developer role or higher.` | Give the agent account at least the Developer role on the project |
+| `The project lives on …; the GitLab Source names …` | Set `host` to the host the project's web address names |
 | A Ticket fails with `The prepare command failed: …` | The output names the cause, such as a wrong clone path; fix the command, then retry the Ticket |
-| `git does not read the github.com credential configuration dsh-superagent writes` | Install git 2.32 or later |
+| `git does not read the credential configuration dsh-superagent writes` | Install git 2.32 or later |
 | A Ticket fails with `The git configuration of the repository in … sets …` | Remove the named credential or `http.*.extraheader` settings from the clone's `.git/config` |
 | `… was not written by dsh-superagent` | Move the named file out of `<stateDir>/worker-bin` or `<stateDir>/worker-gitconfig`, or choose another `stateDir` |
 | `The bot lark-cli allows user identities` | Point the Feishu Source at a bot-only configuration, as in Feishu bot above |

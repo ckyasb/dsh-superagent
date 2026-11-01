@@ -63,17 +63,31 @@ export class Commands {
    */
   constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal) {}
   get deployment(): Deployment { return this.resolved() }
-  get repository(): string { return this.deployment.repository }
+  get repository(): string {
+    if (!this.deployment.github) throw new Error('The GitHub Source is not configured')
+    return this.deployment.github.repository
+  }
   withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
   async run(program: string, args: string[], cwd?: string): Promise<string> {
     try {
       const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', GLAB_NO_PROMPT: '1', NO_PROMPT: '1',
+          LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
       return stdout
     } catch (error) { throw commandError(error, program) }
   }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  async gh<T>(args: string[]): Promise<T> {
+    const github = this.deployment.github
+    if (!github) throw new Error('The GitHub Source is not configured')
+    return JSON.parse(await this.run(github.cli, args)) as T
+  }
+  /** Runs the agent's GitLab CLI (a `glab` wrapper) and parses its JSON output; callers should prefer `gitlabApi`. */
+  async gitlab<T>(args: string[]): Promise<T> {
+    const gitlab = this.deployment.gitlab
+    if (!gitlab) throw new Error('The GitLab Source is not configured')
+    return JSON.parse(await this.run(gitlab.cli, args)) as T
+  }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -82,7 +96,7 @@ export class Commands {
   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async api(path: string, ...flags: string[]): Promise<string>
   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
+    if (typeof schema === 'string') return this.run(this.githubCli(), ['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
   }
@@ -95,6 +109,53 @@ export class Commands {
     const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
     if (outside) throw new Error('GitHub calls are restricted to the configured repository')
     return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
+  }
+  private githubCli(): string {
+    const github = this.deployment.github
+    if (!github) throw new Error('The GitHub Source is not configured')
+    return github.cli
+  }
+  /**
+   * Calls the GitLab API on a path within the configured project (an empty path targets the project itself), validating
+   * JSON output when a schema is provided or returning raw CLI output when omitted.
+   * @throws CliError with GitLab's HTTP status as `code` on failure.
+   */
+  async gitlabApi<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
+  async gitlabApi(path: string, ...flags: string[]): Promise<string>
+  async gitlabApi<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
+    if (typeof schema === 'string') return this.run(this.gitlabCli(), ['api', this.gitlabPath(schema), ...rest])
+    const [path = '', ...flags] = rest
+    return schema.parse(await this.gitlab(['api', this.gitlabPath(path), ...flags]))
+  }
+  /**
+   * Fetches all pages of a GitLab API list within the configured project, adding `per_page=100&page=N` itself (GitLab
+   * pagination is not reliable through `--paginate`), and skipping items that fail schema validation.
+   */
+  async gitlabPages<T>(item: z.ZodType<T>, path: string, tally?: Tally, maxPages = 50): Promise<T[]> {
+    const items: unknown[] = []
+    const page = z.array(z.unknown())
+    for (let number = 1; number <= maxPages; number += 1) {
+      const joined = path.includes('?') ? `${path}&per_page=100&page=${number}` : `${path}?per_page=100&page=${number}`
+      const entries = page.parse(await this.gitlab(['api', this.gitlabPath(joined)]))
+      items.push(...entries)
+      if (entries.length < 100) break
+    }
+    return validItems(item, items, tally)
+  }
+  private gitlabPath(path: string): string {
+    const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
+    if (outside) throw new Error('GitLab calls are restricted to the configured project')
+    return path ? `projects/${this.projectId}/${path}` : `projects/${this.projectId}`
+  }
+  private get projectId(): number {
+    const gitlab = this.deployment.gitlab
+    if (!gitlab) throw new Error('The GitLab Source is not configured')
+    return gitlab.projectId
+  }
+  private gitlabCli(): string {
+    const gitlab = this.deployment.gitlab
+    if (!gitlab) throw new Error('The GitLab Source is not configured')
+    return gitlab.cli
   }
   /**
    * Runs the Feishu bot's `lark-cli` and returns the JSON `data` payload.

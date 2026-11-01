@@ -83,6 +83,7 @@ let answers: Record<string, string | Error>
 const AGENT = () => join(directory, 'agent-gh')
 const OTHER = () => join(directory, 'other-gh')
 const BOT = () => join(directory, 'lark-bot')
+const GLAB = () => join(directory, 'agent-glab')
 const HELPERS = 'git config -z --show-origin --get-all credential.https://github.com.helper'
 const SCOPED = 'git config -z --show-scope --get-regexp ^(credential\\..*|http\\..*extraheader)$'
 const subprocess = { spawn: vi.fn((spec: { argv: readonly string[] }) => {
@@ -94,12 +95,14 @@ const subprocess = { spawn: vi.fn((spec: { argv: readonly string[] }) => {
   return { done: Promise.resolve({ exitCode: answer instanceof Error ? 1 : 0, signal: null }), collected: { stdout: reader(answer instanceof Error ? '' : answer), stderr: reader(answer instanceof Error ? answer.message : '') } }
 }) }
 /** Source account overrides for test setup; `feishu: null` disables the Feishu source. */
-interface Accounts { github?: Record<string, unknown>; feishu?: Record<string, unknown> | null }
+interface Accounts { github?: Record<string, unknown>; gitlab?: Record<string, unknown>; feishu?: Record<string, unknown> | null }
 function seed(store: Store, accounts: Accounts = {}): void {
   const settings = store.settings()
   const { feishu: _feishu, ...others } = settings.sources
   const feishu = accounts.feishu === null ? undefined : { ...settings.sources.feishu?.config, cli: BOT(), ...accounts.feishu }
-  store.saveSettings(SettingsSchema.parse({ ...settings, sources: { ...others, github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT(), ...accounts.github } }, ...feishu ? { feishu: { enabled: true, config: feishu } } : {} } }))
+  store.saveSettings(SettingsSchema.parse({ ...settings, sources: { ...others, github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT(), ...accounts.github } },
+    ...accounts.gitlab ? { gitlab: { enabled: true, config: accounts.gitlab } } : {},
+    ...feishu ? { feishu: { enabled: true, config: feishu } } : {} } }))
 }
 let restarts: ReturnType<typeof vi.fn<() => void>>
 async function restart(machine: Partial<Machine> = {}, accounts: Accounts = {}): Promise<Runtime> {
@@ -868,6 +871,33 @@ it('reports each setup problem where the operator fixes it, and checks the agent
   expect(next.feishuProblem).toMatchObject({ place: 'feishu', code: 'feishuUserIdentity', values: { mode: 'off' } })
 })
 
+it('runs with only a GitLab Source configured, and waits when neither Source names a repository', async () => {
+  const glabHelper = 'git config -z --show-origin --get-all credential.https://git.zju.edu.cn.helper'
+  answers[`${GLAB()} api user`] = '{"id":9,"username":"gitlab-bot","name":"GitLab Bot"}'
+  answers[`${GLAB()} api projects/acme%2Fwidgets`] = '{"id":42,"path_with_namespace":"acme/widgets","web_url":"https://git.zju.edu.cn/acme/widgets","default_branch":"main","permissions":{"project_access":null,"group_access":{"access_level":40}}}'
+  answers[glabHelper] = `file:${workerGitConfig(directory)}\0${credentialHelper(GLAB())}\0`
+  writeFileSync(GLAB(), '#!/bin/sh\n', { mode: 0o755 })
+  const next = await restart({}, { feishu: null, github: { repository: '', cli: '' },
+    gitlab: { host: 'git.zju.edu.cn', project: 'acme/widgets', cli: GLAB() } })
+  await next.ready
+  expect(next.configured()).toBe(true)
+  expect(next.deployment.github).toBeUndefined()
+  expect(next.deployment.gitlab).toMatchObject({ host: 'git.zju.edu.cn', project: 'acme/widgets', projectId: 42, login: 'gitlab-bot', userId: 9,
+    name: 'GitLab Bot', commitEmail: 'gitlab-bot@noreply.git.zju.edu.cn', defaultBranch: 'main' })
+  expect(next.setupProblem).toBeUndefined()
+  expect(readdirSync(join(directory, 'worker-bin')).sort()).toEqual(['gh', 'glab', 'lark-cli'])
+  expect(readFileSync(join(directory, 'worker-bin', 'glab'), 'utf8')).toContain(`exec '${GLAB()}'`)
+  expect(readFileSync(workerGitConfig(directory), 'utf8')).toContain('[credential "https://git.zju.edu.cn"]')
+  // A GitLab-only panel view shows the GitLab project and no GitHub repository.
+  expect(((await api('GET', 'state')).body as { setup: { accounts: Record<string, unknown> } }).setup.accounts).toMatchObject({
+    repository: null, agent: null, gitlab: { host: 'git.zju.edu.cn', project: 'acme/widgets', login: 'gitlab-bot', webUrl: 'https://git.zju.edu.cn/acme/widgets' } })
+  // Neither Source names a repository: setup blocks the whole service.
+  const neither = await restart({}, { feishu: null, github: { repository: '', cli: '' }, gitlab: {} })
+  await neither.ready
+  expect(neither.configured()).toBe(false)
+  expect(neither.setupProblem).toMatchObject({ place: 'deployment', code: 'noRepository' })
+})
+
 it('reports a failure to write the agent environment as environmentFailed and leaves this process\'s environment as it was', async () => {
   await runtime.stop()
   // The shim directory cannot be made: a file has its name.
@@ -972,12 +1002,12 @@ it('runs setup again while the Feishu bot check failed, and restores the process
 
 it('writes worker shims and the agent environment from the configuration only, and restores the environment on stop', async () => {
   const bin = join(directory, 'worker-bin')
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli'])
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain(`exec '${BOT()}'`)
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, blockedCommands: ['personal-gh'] } })
   const next = await restart({}, { feishu: null })
   await next.ready
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli', 'personal-gh'])
   expect(readFileSync(join(bin, 'personal-gh'), 'utf8')).toContain('personal-gh is blocked in this installation; use gh, which acts as agent-bot.')
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain('lark-cli is unavailable: this installation has no Feishu bot.')
   expect(readFileSync(join(bin, 'gh'), 'utf8')).toContain(`exec '${AGENT()}'`)
@@ -1004,9 +1034,9 @@ it('rewrites the blocked-command shims when the Executor settings change them, w
   const bin = join(directory, 'worker-bin')
   const save = (blockedCommands: string[]) => runtime.settings.save('executor', { ...runtime.store.settings().executor, blockedCommands }, runtime.store.blockRevision('executor'), 'panel')
   expect(await save(['personal-gh'])).toMatchObject({ saved: true, restarting: false })
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli', 'personal-gh'])
   await save([])
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli'])
   // The commands workers need cannot be blocked.
   await expect(save(['gh'])).rejects.toThrow()
   expect(restarts).not.toHaveBeenCalled()

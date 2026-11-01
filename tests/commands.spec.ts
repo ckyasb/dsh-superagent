@@ -12,8 +12,8 @@ import { testDeployment } from './fixtures/deployment.ts'
 const sources = new SourceRegistry(() => SettingsSchema.parse({}))
 sources.register(feishuKind); sources.register(githubKind)
 const send = (commands: Commands, message: OutboundMessage) => sources.send(message, commands)
-const deployment = testDeployment({ github: { ...testDeployment().github, cli: '/path/agent-gh' } })
-const REPOSITORY = deployment.repository
+const deployment = testDeployment({ github: { ...testDeployment().github!, cli: '/path/agent-gh' } })
+const REPOSITORY = deployment.github!.repository
 const reply = { id: 'stable-operation', channel: githubChannel(8), text: 'Done', kind: 'reply' as const }
 describe('account-isolated operations', () => {
   it('uses the agent account\'s GitHub CLI and preserves literal shell metacharacters in argv', async () => {
@@ -158,6 +158,53 @@ describe('GitHub calls', () => {
     expect(tally).toEqual({ skipped: 1 })
     run.mockResolvedValue('{"message":"not a list"}')
     await expect(value.pages(z.looseObject({ id: z.number() }), 'issues/12/comments')).rejects.toThrow()
+  })
+})
+
+describe('GitLab calls', () => {
+  const gitlab = { cli: '/path/agent-glab', host: 'git.zju.edu.cn', project: 'acme/widgets', projectId: 42, webUrl: 'https://git.zju.edu.cn/acme/widgets',
+    defaultBranch: 'main', login: 'agent-bot', userId: 9, name: 'Agent Bot', commitEmail: 'agent-bot@noreply.git.zju.edu.cn' }
+  const commands = () => new Commands(() => testDeployment({ github: undefined, gitlab }), {}, new AbortController().signal)
+  it('go only to paths inside the configured project, and validate what GitLab answers', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run').mockResolvedValue('{"number":12,"title":"Login fails","extra":true}')
+    expect(await value.gitlabApi(z.looseObject({ number: z.number() }), 'issues/12')).toEqual({ number: 12, title: 'Login fails', extra: true })
+    expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/42/issues/12'])
+    await expect(value.gitlabApi(z.looseObject({ number: z.string() }), 'issues/12')).rejects.toThrow()
+    for (const path of ['../other/project/issues', 'issues/../../x', '/projects/7', 'https://git.zju.edu.cn/x']) {
+      await expect(value.gitlabApi(z.unknown(), path)).rejects.toThrow('restricted to the configured project')
+    }
+    expect(run).toHaveBeenCalledTimes(2)
+    // An empty path targets the project itself.
+    await value.gitlabApi(z.unknown(), '')
+    expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/42'])
+    // Without a schema, gitlabApi() returns the raw CLI stdout.
+    run.mockResolvedValue('raw text')
+    expect(await value.gitlabApi('repository/files/README.md/raw?ref=main', '--include')).toBe('raw text')
+  })
+  it('page a list by page themselves, and stop at a short page or the page limit', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run')
+    const full = JSON.stringify(Array.from({ length: 100 }, (_, index) => ({ id: index })))
+    run.mockImplementation(async () => full)
+    expect(await value.gitlabPages(z.looseObject({ id: z.number() }), 'issues?state=opened', undefined, 1)).toHaveLength(100)
+    expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/42/issues?state=opened&per_page=100&page=1'])
+    // A page with fewer than 100 entries ends the list.
+    run.mockImplementation(async (_program, args) => JSON.stringify(
+      Array.from({ length: Number(/\bpage=(\d+)$/.exec(args[1]!)?.[1]) === 2 ? 3 : 100 }, (_, index) => ({ id: index }))))
+    expect(await value.gitlabPages(z.looseObject({ id: z.number() }), 'issues')).toHaveLength(103)
+    expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/42/issues?per_page=100&page=2'])
+    // The page limit ends the list even while every page is full.
+    run.mockImplementation(async () => full)
+    expect(await value.gitlabPages(z.looseObject({ id: z.number() }), 'issues', undefined, 2)).toHaveLength(200)
+    expect(await value.gitlabPages(z.looseObject({ id: z.number() }), 'issues', undefined, 3)).toHaveLength(300)
+  })
+  it('refuse GitLab and GitHub commands the deployment does not configure', async () => {
+    await expect(new Commands(() => testDeployment({ gitlab: undefined }), {}, new AbortController().signal).gitlabApi('issues')).rejects.toThrow('The GitLab Source is not configured')
+    await expect(new Commands(() => testDeployment({ gitlab: undefined }), {}, new AbortController().signal).gitlab(['api', 'user'])).rejects.toThrow('The GitLab Source is not configured')
+    await expect(new Commands(() => testDeployment({ github: undefined }), {}, new AbortController().signal).api('issues')).rejects.toThrow('The GitHub Source is not configured')
+    await expect(new Commands(() => testDeployment({ github: undefined }), {}, new AbortController().signal).gh(['api', 'user'])).rejects.toThrow('The GitHub Source is not configured')
+    expect(() => new Commands(() => testDeployment({ github: undefined }), {}, new AbortController().signal).repository).toThrow('The GitHub Source is not configured')
   })
 })
 it('says how to add the bot to a chat when Feishu answers that it is not a member, and keeps the code', async () => {

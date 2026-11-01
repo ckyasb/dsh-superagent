@@ -779,6 +779,12 @@ describe('github source', () => {
       const off = await start({}, { enabled: false, config: {} })
       await vi.waitFor(() => expect(off.value.health.github).toMatchObject({ state: 'paused', code: 'sourceOff' }))
       await off.stop()
+      // Configured without a GitHub account, the Source pauses and names what is missing instead of polling.
+      const reads = vi.spyOn(Commands.prototype, 'run')
+      const unconfigured = await start({ deployment: testDeployment({ github: undefined }) }, { enabled: true, config: {} })
+      await vi.waitFor(() => expect(unconfigured.value.health.github).toMatchObject({ state: 'paused', detail: 'The GitHub Source is not configured.' }))
+      expect(reads).not.toHaveBeenCalled()
+      await unconfigured.stop()
       // Rounds fail, succeed, fail, fail: only the last two in a row make the error. A round reads through a Commands of its own.
       const outcomes = [false, true, false, false]
       let round = 0
