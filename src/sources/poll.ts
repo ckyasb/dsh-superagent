@@ -1,6 +1,6 @@
-/** Shared polling helpers for subscribed threads, overlap-safe cursors, and timer-friendly delays. */
+/** Shared polling helpers for subscribed threads, overlap-safe cursors, failure thresholds, and timer-friendly delays. */
 import { liveTicket, type Thread } from '../core/index.ts'
-import type { SourceContext } from './host.ts'
+import { health, type Health, type SourceContext } from './host.ts'
 
 /** How long a subscribed Thread with no live Ticket continues to be polled after its last Trigger or Ticket end. */
 export const POLL_HORIZON_MS = 14 * 24 * 3600_000
@@ -28,6 +28,10 @@ export async function pollThreads(ctx: SourceContext, source: string, stopped: (
       ctx.threads.patch(thread.key, { pollError: String(error) })
     }
   }
+}
+/** Returns an error health once `failures` consecutive polls fail, or undefined so a single network interruption stays quiet. */
+export function pollFailure(failures: number, threshold: number, error: unknown): Health | undefined {
+  return failures >= threshold ? health('error', 'pollFailures', { count: String(failures), error: String(error) }) : undefined
 }
 /** Waits `ms` or until `signal` aborts using global `setTimeout` so test fake timers can drive polling loops. */
 export function pause(ms: number, signal: AbortSignal): Promise<void> {
