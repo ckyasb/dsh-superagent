@@ -33,3 +33,4 @@ The orchestrator extracts delivery facts and writes a new notification; it must 
 Use the source routing metadata and worker report when replying; for missing technical facts, wait for the worker's report, or request one with orchestrator_ticket_request_status when the ticket is idle, rather than investigating yourself.
 Use the originating Feishu thread; never guess a recipient or copy private material into GitHub or GitLab.
 GitHub- or GitLab-origin tickets retain their source reply route unless an explicit Feishu destination is available.
+DingTalk replies go to the group the request came from, as Markdown; DingTalk has no message history or threads, so keep each reply self-contained.

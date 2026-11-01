@@ -17,6 +17,7 @@
     "./github-watch": "./lib/github-watch.js",
     "./gitlab-watch": "./lib/gitlab-watch.js",
     "./feishu-watch": "./lib/feishu-watch.js",
+    "./dingtalk-watch": "./lib/dingtalk-watch.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
@@ -57,6 +58,7 @@
   },
   "packageManager": "pnpm@11.7.0",
   "dependencies": {
+    "dingtalk-stream": "2.1.5",
     "proper-lockfile": "4.1.2",
     "zod": "4.4.3"
   },

@@ -1,6 +1,6 @@
 /** Plugin configuration and startup verification for repository access and agent CLI identities. */
 import { LIMITS } from './limits.ts'
-import { accessSync, constants, statSync } from 'node:fs'
+import { accessSync, constants, readFileSync, statSync } from 'node:fs'
 import { delimiter, isAbsolute, join } from 'node:path'
 import type { Volatile } from '@deepseek-ai/cordis'
 import s from '@deepseek-ai/schemastery'
@@ -52,14 +52,17 @@ export const GitlabAccountsSchema = z.object({
   cli: z.string().trim().default(''),
 })
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
+export const DingtalkBotSchema = z.object({ credentialDir: z.string().trim().default('') })
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
 export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape),
-  gitlab: Object.keys(GitlabAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
+  gitlab: Object.keys(GitlabAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape),
+  dingtalk: Object.keys(DingtalkBotSchema.shape) }
 
 export interface Deployment extends Machine {
   github?: GithubAccount
   gitlab?: GitlabAccount
   feishu?: FeishuBot
+  dingtalk?: DingtalkBot
 }
 export interface GithubAccount { cli: string; login: string; noreply: string; repository: string }
 export interface GitlabAccount {
@@ -67,6 +70,8 @@ export interface GitlabAccount {
   login: string; userId: number; name: string; commitEmail: string
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
+/** The DingTalk bot: its credential directory and its app key, which is also the robot code replies are sent as. */
+export interface DingtalkBot { credentialDir: string; clientId: string; robotCode: string }
 
 /** Resolve a command name or absolute path to an executable file, ignoring the worker shim directory. */
 export function executable(name: string, path: string, exclude?: string): string {
@@ -178,4 +183,54 @@ export async function resolveFeishuBot(machine: Machine, feishu: unknown, probe:
   const info = parsed(BotInfo, (await run('api', 'GET', '/open-apis/bot/v3/info', '--as', 'bot', '--format', 'ndjson')).split('\n')[0] ?? '')
   if (!info) return fail(new SetupError('feishuNoBot'))
   return { cli, appId: status.appId, brand: status.brand, botId: info.bot.open_id, name: info.bot.app_name }
+}
+
+/** Reads one credential file and trims it; a missing or empty file reports which one. */
+function credentialFile(dir: string, name: string): string {
+  if (!dir) throw new SetupError('dingtalkCredentialsMissing', { output: `${name} file: the credential directory is not set` })
+  let text: string
+  try { text = readFileSync(join(dir, name), 'utf8') } catch (error) {
+    throw new SetupError('dingtalkCredentialsMissing', { output: `${name} file: ${reason(error)}` })
+  }
+  const value = text.trim()
+  if (!value) throw new SetupError('dingtalkCredentialsMissing', { output: `${name} file: the file is empty` })
+  return value
+}
+/** Reads the bot's `clientId` and `clientSecret` from the two files of its credential directory; never cached. */
+export function readDingtalkCredentials(dir: string): { clientId: string; clientSecret: string } {
+  return { clientId: credentialFile(dir, 'clientId'), clientSecret: credentialFile(dir, 'clientSecret') }
+}
+/** A cached access token: one per app key, refreshed 60 seconds before DingTalk's `expireIn` runs out. */
+let dingtalkToken: { clientId: string; accessToken: string; expiresAt: number } | undefined
+/** Forgets the cached DingTalk access token; tests use it to start from an empty cache. */
+export function resetDingtalkTokenCache(): void { dingtalkToken = undefined }
+/** Returns an access token for the app key, exchanging the credentials only when the cached one nears expiry. */
+export async function dingtalkAccessToken(clientId: string, clientSecret: string): Promise<string> {
+  if (dingtalkToken?.clientId === clientId && dingtalkToken.expiresAt > Date.now()) return dingtalkToken.accessToken
+  let answer: { accessToken?: string; expireIn?: number }
+  try {
+    const response = await fetch('https://api.dingtalk.com/v1.0/oauth2/accessToken', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ appKey: clientId, appSecret: clientSecret }), signal: AbortSignal.timeout(20_000) })
+    answer = await response.json() as typeof answer
+    if (!response.ok || !answer.accessToken) throw new Error(`HTTP ${response.status}`)
+  } catch (error) {
+    // The output must never contain the secret, so only the failure's own short reason is surfaced.
+    throw new SetupError('dingtalkTokenFailed', { output: error instanceof Error ? error.message : String(error) })
+  }
+  const accessToken = answer.accessToken!
+  dingtalkToken = { clientId, accessToken, expiresAt: Date.now() + (Number(answer.expireIn ?? 7200) - 60) * 1000 }
+  return accessToken
+}
+/**
+ * Resolves the DingTalk bot from the credential directory configured on the DingTalk Source, or finds none when it names
+ * none. The secret stays in the credential files: the resolved bot carries only the app key, which is also the robot code.
+ */
+export async function resolveDingtalkBot(machine: Machine, dingtalk: unknown, probe?: Probe): Promise<DingtalkBot | undefined> {
+  void machine, probe
+  const { credentialDir } = DingtalkBotSchema.parse(dingtalk ?? {})
+  if (!credentialDir) return undefined
+  const { clientId, clientSecret } = readDingtalkCredentials(credentialDir)
+  await dingtalkAccessToken(clientId, clientSecret)
+  return { credentialDir, clientId, robotCode: clientId }
 }

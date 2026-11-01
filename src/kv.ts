@@ -59,4 +59,6 @@ export const KV = {
   gitlab: { sinceIssues: record<string>('gitlab-since:issues'), sinceMrs: record<string>('gitlab-since:mrs'),
     sinceEvents: record<string>('gitlab-since:events'),
     cursor: family<string, [target: 'issue' | 'mr', iid: number]>('gitlab-cursor:') },
+  /** DingTalk Source: outgoing message ids already delivered, since the send API has no idempotency key. */
+  dingtalk: { sent: family<boolean, [message: string]>('dingtalk-sent:') },
 }
