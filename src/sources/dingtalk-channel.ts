@@ -44,7 +44,8 @@ export async function sendDingtalk(ctx: SendHost, message: OutboundMessage): Pro
   const address = message.channel.address
   const direct = address.direct === '1'
   const staffId = address.senderStaffId
-  if (!staffId || (!direct && !address.conversationId)) throw new Error('Missing DingTalk reply target')
+  // A group message from a cluster event has no requester, so a group send needs only the conversation; a direct chat still needs its person.
+  if (direct ? !staffId : !address.conversationId) throw new Error('Missing DingTalk reply target')
   const text = checkedImText(message.text)
   // DingTalk's Markdown cannot mention a person, so the reply opens with the requester's nickname instead.
   const nick = address.senderNick ?? ''

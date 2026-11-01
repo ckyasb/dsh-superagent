@@ -18,6 +18,7 @@
     "./gitlab-watch": "./lib/gitlab-watch.js",
     "./feishu-watch": "./lib/feishu-watch.js",
     "./dingtalk-watch": "./lib/dingtalk-watch.js",
+    "./cluster-watch": "./lib/cluster-watch.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },

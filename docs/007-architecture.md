@@ -384,6 +384,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/dingtalk-trigger.ts` | A pushed robot message as a Trigger: Thread by group and sender, or by the sender alone in a direct chat |
 | `src/sources/dingtalk-channel.ts` | The DingTalk Channel: group and direct-chat Markdown sends, once per message via a KV record, `sent` or `gone` |
 | `src/sources/dingtalk-stream.ts` | The Stream connection loop: the SDK client behind an injectable factory, receipts, backoff and health |
+| `src/sources/cluster.ts` | The Cluster kind and plugin entry, exported as `./cluster-watch`: a poll round of the Argo CD applications and the patrol Jobs, with the kind's scope, policy rows and environment |
+| `src/sources/cluster-argocd.ts` | Argo CD applications as senderless Triggers: what counts as failed, the fingerprint's revision, the shared Source id and the DingTalk reply channel |
+| `src/sources/cluster-patrol.ts` | The patrol: finished Jobs of the CronJob, the report read from a Job's log, and the alert or failure as a senderless Trigger |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
@@ -407,7 +410,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/locales.ts` | All copy in both languages, and the glossary of [001 Domain model](001-domain.md) |
 | `src/client/client.css`, `css.d.ts` | The panel's stylesheet, loaded as text |
 
-`src/sources/github.ts`, `src/sources/gitlab.ts`, `src/sources/feishu.ts` and `src/sources/dingtalk.ts` are also the entries of the four Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch`, `./gitlab-watch`, `./feishu-watch` and `./dingtalk-watch`. The bundle's `cordis.patch.yml` inserts the five plugins, with Feishu and DingTalk disabled.
+`src/sources/github.ts`, `src/sources/gitlab.ts`, `src/sources/feishu.ts`, `src/sources/dingtalk.ts` and `src/sources/cluster.ts` are also the entries of the five Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch`, `./gitlab-watch`, `./feishu-watch`, `./dingtalk-watch` and `./cluster-watch`. The bundle's `cordis.patch.yml` inserts the six plugins, with Feishu, DingTalk and Cluster disabled.
 
 ## Tests
 
@@ -419,6 +422,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
 | `tests/dingtalk.spec.ts` | The DingTalk Source: credential resolution, translation, scope, policy rows, the Channel with its dedup and `gone`, the Stream loop with a fake client, and setup that leaves DingTalk out without blocking |
+| `tests/cluster.spec.ts` | The Cluster Source on a `SourceContext` with fake kubectl output: Argo CD baselines and failure fingerprints, patrol Job reports and failures, the kind's scope, policy rows and environment, the plugin's paused health, and the DingTalk group send without a sender |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/gitlab.spec.ts` | The GitLab Source on a `SourceContext`: translation, polls and read positions, the Channel and Thread context, health |

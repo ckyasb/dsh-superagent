@@ -13,6 +13,7 @@ export const HEALTH_TEXT = {
   notConfigured: 'The GitHub Source is not configured.',
   gitlabNotConfigured: 'The GitLab Source is not configured.',
   dingtalkNotConfigured: 'The DingTalk Source is not configured.',
+  clusterNothingEnabled: 'Neither the Argo CD watch nor the patrol is enabled.',
   sourceOff: 'Off',
   feishuCliUnset: 'The Source is on, and its bot lark-cli is not set',
   feishuBotMissing: 'Waiting for the Feishu bot',

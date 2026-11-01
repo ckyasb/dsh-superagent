@@ -106,6 +106,17 @@ Workers call the same wrapper as `glab`, and their git pushes to `https://<host>
 3. Add the robot to the group you want it to serve. To find a group's `conversationId` (the `cid…==` openConversationId), @ the bot there once: the log line that reports the message as filtered by `chat_not_listed` carries the `conversationId`, and the panel's Sources page shows it. Put that value in the Source's chats table.
 4. DingTalk pushes only messages that @ the bot, and gives no way to read history, so there is no history recovery and no member sync. In the Policy's admission table, set the group's row cell "not on the list, addressing the agent" (未列出、@ 机器人) to **explicit** to let everyone in the group request work by @-mentioning the bot.
 
+### Cluster events (optional)
+
+The Cluster Source watches the cluster the Pod runs in, read-only, through the Pod's ServiceAccount and `KUBECONFIG`. It needs no account of its own; it calls `kubectl get` and `kubectl logs` only, so grant the ServiceAccount's Role nothing more than:
+
+- `get` on `applications.argoproj.io` in the Argo CD namespace (argocd by default);
+- `get` on `jobs` and `get` on `pods/log` in the patrol namespace (dsh by default).
+
+Two switches on the Source card decide what it watches: **接收 Argo CD 同步失败** turns on the Argo CD watch, and **接收每日巡检异常** turns on the patrol, which reads the logs of the finished Jobs of the `dsh-patrol` CronJob (manual `kubectl create job --from=cronjob/dsh-patrol` Jobs included). **报告到的钉钉群 conversationId** names the DingTalk group the replies to these events go to; leave it empty and the Triggers appear only in the panel, with no channel to answer in. Argo CD applications on the ignore list are never checked.
+
+Neither watch produces an explicit request: a cluster event has no sender, so its admission row offers only the "not on the list, not addressing the agent" cell (未列出、未 @ 机器人), and the Trigger can only become an inferred candidate. Start with the accept mode `observe`, read the recorded Decisions to see what the Source would accept under your rules, and only then switch the mode to `auto`. The first round after each switch records baselines — the applications' current state and the newest finished patrol Job — and produces no Triggers.
+
 ## Install
 
 Run this block once, on a machine that has no `superagent` profile yet:

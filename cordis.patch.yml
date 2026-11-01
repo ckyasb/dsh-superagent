@@ -17,6 +17,10 @@
     - id: dsh-superagent-dingtalk
       name: dsh-superagent/dingtalk-watch
       disabled: true
+    # Optional Cluster Source; watches Argo CD sync failures and the daily patrol once its switches are on.
+    - id: dsh-superagent-cluster
+      name: dsh-superagent/cluster-watch
+      disabled: true
     # The agent preset of every Executor Session (WORKER_PRESET in src/app/sessions.ts); the main Session has its own, below.
     # It is DSH's `standard` preset with only what a worker needs, and a shell whose foreground command moves to a background job
     # after 5 seconds, so a long command does not hold back a person's message, which the Session takes at its next step. Left

@@ -61,4 +61,10 @@ export const KV = {
     cursor: family<string, [target: 'issue' | 'mr', iid: number]>('gitlab-cursor:') },
   /** DingTalk Source: outgoing message ids already delivered, since the send API has no idempotency key. */
   dingtalk: { sent: family<boolean, [message: string]>('dingtalk-sent:') },
+  /**
+   * Cluster Source: per-Argo CD application the last fingerprint (revision and failure) with the revision counter that
+   * counts its reported failures, and the newest patrol Job already processed, by name and end time.
+   */
+  cluster: { argocd: family<{ fingerprint: string; revision: number }, [app: string]>('cluster-argocd:'),
+    patrol: record<{ job: string; at: string }>('cluster-patrol-cursor') },
 }
