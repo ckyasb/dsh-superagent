@@ -71,7 +71,7 @@ export class Commands {
   async run(program: string, args: string[], cwd?: string): Promise<string> {
     try {
       const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', GLAB_NO_PROMPT: '1', NO_PROMPT: '1',
+        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', GLAB_NO_PROMPT: '1',
           LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
       return stdout
     } catch (error) { throw commandError(error, program) }

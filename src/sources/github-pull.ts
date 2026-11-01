@@ -3,7 +3,10 @@ import { z } from 'zod'
 import { key, liveTicket, type Follow, type OutboundMessage, type ThreadFact, type Ticket } from '../core/index.ts'
 import type { Deployment } from '../deployment.ts'
 import { sameName } from '../infra/text.ts'
+import { ticketBranch } from './branch.ts'
 import type { SourceContext } from './host.ts'
+
+export { ticketBranch } from './branch.ts'
 import { githubPage, SOURCE, UserSchema } from './github-trigger.ts'
 
 const PullSchema = z.looseObject({
@@ -23,9 +26,6 @@ export const pullOf = (ticket: Pick<Ticket, 'follows'>): number | undefined => p
 export const agentPull = (pr: { user: { login: string }; head?: { repo?: { full_name: string } | null } | null },
   deployment: Pick<Deployment, 'github'>): boolean =>
   sameName(pr.user.login, deployment.github!.login) && sameName(pr.head?.repo?.full_name ?? '', deployment.github!.repository)
-/** True when a branch belongs to the ticket: its last path segment is the ticket's short name, such as `agent/<name>`. */
-export const ticketBranch = (ticket: Pick<Ticket, 'execution'>, ref: string): boolean =>
-  !!ticket.execution?.name && ref.split('/').at(-1) === ticket.execution.name
 const AUTO_MERGE_ON: ThreadFact = { label: { zh: '自动合并', en: 'Auto-merge' }, value: { zh: '已开启', en: 'on' } }
 
 /**

@@ -367,10 +367,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/github-pull.ts` | The pull request rules: which pull requests a Ticket follows (`claimPull`, `observePull`), the closes it reports to the Engine, and `pullEndNotices`, the chat notice of a Ticket that ended merged or closed |
 | `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone` |
 | `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page |
-| `src/sources/gitlab.ts` | The GitLab kind and plugin entry, exported as `./gitlab-watch`: a poll round of the Issue and merge-request streams and subscribed Threads |
-| `src/sources/gitlab-trigger.ts` | GitLab issues, merge requests, and discussion notes as Triggers, and GitLab reply addresses |
-| `src/sources/gitlab-channel.ts` | The GitLab Channel: issue and merge-request comments and discussion replies, `sent` or `gone` |
-| `src/sources/gitlab-read.ts` | `gitlabThreadContext`: an Issue's or merge request's discussions, flattened into time order |
+| `src/sources/gitlab.ts` | The GitLab kind and plugin entry, exported as `./gitlab-watch`: a poll round of the Issue and merge-request streams, the push-event stream, the merge requests of open Tickets, and subscribed Threads |
+| `src/sources/gitlab-trigger.ts` | GitLab issues, merge requests, commits, pushes, and discussion notes as Triggers, and GitLab reply addresses |
+| `src/sources/gitlab-mr.ts` | The merge request rules: which merge requests a Ticket follows (`claimMergeRequest`, `observeMergeRequest`), the closes it reports to the Engine, and `mergeRequestEndNotices`, the chat notice of a Ticket that ended merged or closed |
+| `src/sources/branch.ts` | `ticketBranch`, the branch rule both forges share: a branch belongs to the Ticket whose short name ends it |
+| `src/sources/gitlab-channel.ts` | The GitLab Channel: issue, merge-request, and commit comments and discussion replies, `sent` or `gone` |
+| `src/sources/gitlab-read.ts` | the `gitlab/` resources, repository reads, and `gitlabThreadContext`: an Issue's or merge request's discussions flattened into time order, or one commit's message and comments |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |

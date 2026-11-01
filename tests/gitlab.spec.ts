@@ -5,6 +5,12 @@ import { type GitlabAccount } from '../src/deployment.ts'
 import { apply as applyGitlab, gitlabKind, pollRound } from '../src/sources/gitlab.ts'
 import { SOURCE, issueTrigger, mentions, mergeRequestTrigger, noteTrigger } from '../src/sources/gitlab-trigger.ts'
 import { sendGitlab } from '../src/sources/gitlab-channel.ts'
+import { claimMergeRequest, mergeRequestEndNotices, mergeRequestOf, mergeRequestsOf, observeMergeRequest, readMergeRequest } from '../src/sources/gitlab-mr.ts'
+import { readGitlab, readGitlabRepositoryPath } from '../src/sources/gitlab-read.ts'
+import { executorTools } from '../src/app/tools/executor.ts'
+import { candidateCard } from '../src/app/links.ts'
+import { TextCache } from '../src/app/cache.ts'
+import type { Ticket } from '../src/core/index.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { Store } from '../src/app/store.ts'
 import { Commands, commandError } from '../src/infra/commands.ts'
@@ -221,6 +227,7 @@ describe('gitlab source', () => {
       issues: () => opened ? [issue(12, { description: 'please @agent-bot look', created_at: at(1), updated_at: at(1) })] : [],
       'issues/12/discussions': () => [],
       merge_requests: () => [],
+      events: () => [],
     })
     await pollRound(h)
     expect(h.receive).not.toHaveBeenCalled()
@@ -255,6 +262,7 @@ describe('gitlab source', () => {
         ? [discussion('d1', batch[0]!.notes.map(item => ({ ...item, created_at: at(1), updated_at: at(1) })))]
         : [],
       merge_requests: () => [],
+      events: () => [],
     })
     await pollRound(h)
     expect(h.receive).not.toHaveBeenCalled()
@@ -278,6 +286,7 @@ describe('gitlab source', () => {
     gitlab(h, {
       issues: () => [], merge_requests: () => [],
       'issues/12/discussions': () => fresh ? [discussion('d1', [note(5, { body: 'quiet follow-up', updated_at: at(-1) })])] : [],
+      events: () => [],
     })
     await pollRound(h)
     expect(h.receive).not.toHaveBeenCalled()
@@ -311,5 +320,327 @@ describe('gitlab source', () => {
     expect(() => gitlabKind.schema.parse({ pollSeconds: 10 })).toThrow()
     expect(() => gitlabKind.schema.parse({ extra: true })).toThrow()
     expect(gitlabKind.health).toEqual(['gitlab'])
+  })
+})
+
+describe('gitlab merge requests', () => {
+  const executionOf = (name: string) => ({ name, directory: `/w/${name}`, assignment: '' })
+  const ticketOf = (id: string, fields: Record<string, unknown> = {}): Ticket =>
+    ({ id, title: id, decisionId: `d-${id}`, mandate: { strength: 'explicit', policyVersion: '', basis: { via: 'listed' },
+      actor: { source: 'gitlab', id: 'carol' }, scope: '' },
+      channels: [{ source: 'feishu', thread: 'feishu:oc_1', address: { chatId: 'oc_1', messageId: 'om_1' } }],
+      assignments: [{ id: 'a', state: 'running', createdAt: '' }], inputs: [], undelivered: [], createdAt: '', updatedAt: '',
+      execution: executionOf(`fix-${id}`), origin: { triggerId: 'x', triggerIds: [] }, ...fields }) as Ticket
+  const mergeRequest = (iid: number, fields: Record<string, unknown> = {}) => ({ iid, title: 'Fix the margin', description: '',
+    state: 'opened', author: author('carol'), created_at: at(-60), updated_at: at(-60), web_url: `${BASE}/-/merge_requests/${iid}`,
+    source_branch: 'fix', target_branch: 'main', source_project_id: 451, draft: false, merged_at: null, closed_at: null, sha: 'abc', ...fields })
+  const agentsMr = (iid: number, branch = 'fix') =>
+    mergeRequest(iid, { author: author('agent-bot'), source_branch: branch })
+  const originTrigger = (iid: number): Trigger =>
+    ({ id: 'src', source: SOURCE, threads: [{ source: SOURCE, id: `mr:${iid}` }], actor: { source: SOURCE, id: 'carol' },
+      human: true, at: at(-120), text: 'fix it', meta: { target: 'mr', iid, kind: 'mr' } })
+
+  it('binds the origin MR and an agent MR on the ticket branch, and refuses others', () => {
+    const h = host()
+    h.store.triggers.save(originTrigger(34))
+    h.store.tickets.save(ticketOf('t1', { origin: { triggerId: 'src', triggerIds: ['src'] } }))
+    // The MR the ticket started from binds even though someone else opened it.
+    expect(claimMergeRequest(h, 't1', mergeRequest(34))).toBeUndefined()
+    expect(h.store.tickets.get('t1')!.follows).toEqual([{ thread: 'gitlab:mr:34', own: false }])
+    expect(mergeRequestOf(h.store.tickets.get('t1')!)).toBe(34)
+    expect(h.store.threads.get('gitlab:mr:34')?.meta).toMatchObject({ target: 'mr', iid: 34, mrAuthor: 'carol', url: `${BASE}/-/merge_requests/34` })
+    // An agent MR whose branch ends with the ticket's short name binds; a fork, a stranger's MR, and a mismatched branch do not.
+    expect(claimMergeRequest(h, 't1', agentsMr(35, `agent/fix-t1`))).toBeUndefined()
+    expect(mergeRequestsOf(h.store.tickets.get('t1')!)).toEqual([34, 35])
+    expect(claimMergeRequest(h, 't1', mergeRequest(36))).toMatch(/DSH_SUPERAGENT_NAME.*agent-bot|agent-bot.*DSH_SUPERAGENT_NAME/)
+    expect(claimMergeRequest(h, 't1', mergeRequest(37, { author: author('agent-bot'), source_project_id: 999 })))
+      .toMatch(/DSH_SUPERAGENT_NAME/)
+    expect(claimMergeRequest(h, 't1', agentsMr(38, 'agent/something-else'))).toMatch(/DSH_SUPERAGENT_NAME/)
+    expect(mergeRequestsOf(h.store.tickets.get('t1')!, true)).toEqual([34, 35])
+    // An MR another open ticket already follows is refused.
+    h.store.tickets.save(ticketOf('t2', { follows: [{ thread: 'gitlab:mr:39', own: true }] }))
+    expect(claimMergeRequest(h, 't1', agentsMr(39, 'agent/fix-t1'))).toMatch(/another active ticket/)
+    h.store.close()
+  })
+
+  it('ends tickets when their MR merges or closes, and auto-binds the unique ticket on an open agent MR', async () => {
+    const h = host()
+    h.store.tickets.save(ticketOf('t1'))
+    await observeMergeRequest(h, agentsMr(41, 'agent/fix-t1') as never)
+    expect(mergeRequestOf(h.store.tickets.get('t1')!)).toBe(41)
+    expect(await observeMergeRequest(h, mergeRequest(41, { author: author('agent-bot'), source_branch: 'agent/fix-t1',
+      state: 'merged', merged_at: '2026-09-02T00:00:00Z' }) as never)).toBe(true)
+    expect(h.store.tickets.get('t1')).toMatchObject({ ended: { by: 'executor', outcome: 'merged', at: '2026-09-02T00:00:00.000Z' } })
+    expect(h.store.threads.get('gitlab:mr:41')?.subscriptions).toEqual(['t1'])
+    // A closed (unmerged) MR ends its ticket as closed.
+    h.store.tickets.save(ticketOf('t2', { follows: [{ thread: 'gitlab:mr:42', own: true }] }))
+    await observeMergeRequest(h, mergeRequest(42, { author: author('agent-bot'), source_branch: 'agent/fix-t2',
+      state: 'closed', closed_at: '2026-09-03T00:00:00Z' }) as never)
+    expect(h.store.tickets.get('t2')).toMatchObject({ ended: { outcome: 'closed' } })
+    h.store.close()
+  })
+
+  it('notices the ticket\'s IM conversations, in the request\'s language, and skips its GitLab channel', () => {
+    const h = host()
+    const channels = [{ source: 'feishu', thread: 'feishu:oc_1', address: { chatId: 'oc_1', messageId: 'om_1' } },
+      { source: 'gitlab', thread: 'gitlab:mr:34', address: { target: 'mr', iid: '34' } }]
+    h.store.tickets.save(ticketOf('t1', { channels, follows: [{ thread: 'gitlab:mr:34', own: true,
+      closed: { at: '2026-09-02T00:00:00.000Z', outcome: 'merged' } }] }))
+    const ended = { ...ticketOf('t1', { channels, follows: [{ thread: 'gitlab:mr:34', own: true,
+      closed: { at: '2026-09-02T00:00:00.000Z', outcome: 'merged' } }] }), ended: { by: 'executor' as const, outcome: 'merged' as const,
+      at: '2026-09-02T00:00:00.000Z' } }
+    h.store.tickets.save(ended)
+    const chinese = mergeRequestEndNotices(h.store.tickets.get('t1')!, '修一下标题', BASE)
+    expect(chinese.map(notice => notice.channel.source)).toEqual(['feishu'])
+    expect(chinese[0]!.text).toBe(`[MR !34](${BASE}/-/merge_requests/34) 已合并。`)
+    expect(chinese[0]!.id).toBe(key('mr-terminal', '34', 'feishu', JSON.stringify(channels[0]!.address), 'merged'))
+    h.store.tickets.save({ ...ticketOf('t2', { channels, follows: [{ thread: 'gitlab:mr:35', own: true,
+      closed: { at: '2026-09-02T00:00:00.000Z', outcome: 'closed' } }] }),
+      ended: { by: 'executor' as const, outcome: 'closed' as const, at: '2026-09-02T00:00:00.000Z' } })
+    expect(mergeRequestEndNotices(h.store.tickets.get('t2')!, 'please fix', BASE)[0]!.text)
+      .toBe(`[MR !35](${BASE}/-/merge_requests/35) was closed without merging.`)
+    h.store.close()
+  })
+
+  it('claims a reported MR through orchestrator_report, refuses without a GitLab Source, and leaves no partial state when refused', async () => {
+    const h = host()
+    const toolsFor = (context: typeof h) => executorTools({
+      engine: context.engine, store: context.store, sessions: { relay: vi.fn(), notify: vi.fn() }, resources: {} as never,
+      github: context, gitlab: context, sendReplies: async () => {},
+    } as never, ticketOf('t1'))
+    const report = (tools: ReturnType<typeof toolsFor>, args: Record<string, unknown>) =>
+      tools.find(tool => tool.name === 'orchestrator_report')!.execute(args, new AbortController().signal)
+    // Without a GitLab deployment the argument is refused before any read.
+    const without = host({ deployment: testDeployment({ gitlab: undefined }) })
+    without.store.tickets.save(ticketOf('t1'))
+    await expect(report(toolsFor(without), { state: 'progress', summary: 'x', mr_iid: 34 })).rejects.toThrow('no GitLab Source')
+    // With one, a valid MR binds and the report is recorded.
+    h.store.tickets.save(ticketOf('t1'))
+    gitlab(h, { 'merge_requests/34': () => mergeRequest(34, { author: author('agent-bot'), source_branch: 'agent/fix-t1' }) })
+    await expect(report(toolsFor(h), { state: 'progress', summary: 'opened MR', mr_iid: 34 })).resolves.toMatchObject({ reported: true })
+    expect(mergeRequestOf(h.store.tickets.get('t1')!)).toBe(34)
+    // A refused MR leaves neither the binding nor the report.
+    gitlab(h, { 'merge_requests/35': () => mergeRequest(35) })
+    await expect(report(toolsFor(h), { state: 'progress', summary: 'not mine', mr_iid: 35 })).rejects.toThrow(/DSH_SUPERAGENT_NAME/)
+    expect(mergeRequestsOf(h.store.tickets.get('t1')!, true)).toEqual([34])
+    expect(h.store.tickets.get('t1')!.assignments.at(-1)?.report).toMatchObject({ summary: 'opened MR' })
+    h.store.close(); without.store.close()
+  })
+})
+
+describe('gitlab pushes', () => {
+  const pushSettings = () => SettingsSchema.parse({ eval: { mode: 'auto' },
+    sources: { gitlab: { enabled: true, config: { host: AGENT.host, project: AGENT.project, cli: AGENT.cli, observePushes: true } } },
+    policy: { sources: { gitlab: { allowed: [{ id: 'carol' }] } } } })
+  const event = (id: number, fields: Record<string, unknown> = {}) => ({ id, action_name: 'pushed to', author: author('carol'),
+    author_username: 'carol', created_at: at(-10), push_data: { commit_count: 2, action: 'pushed', ref_type: 'branch',
+      commit_from: 'a'.repeat(40), commit_to: 'b'.repeat(40), ref: 'main', commit_title: 'One' }, ...fields })
+  const sha = 'b'.repeat(40)
+  const pushRoutes = (commits: unknown[] = [{ id: sha, short_id: 'b1b2b3b', title: 'One' }]) => ({
+    issues: () => [], merge_requests: () => [],
+    [`repository/commits/${sha}/merge_requests`]: () => [],
+    'repository/compare': () => ({ commits, diffs: [] }),
+  })
+
+  it('only records a cursor on the first round', async () => {
+    const h = host()
+    const reads = gitlab(h, { issues: () => [], merge_requests: () => [], events: () => [{ ...event(5) }] })
+    await pollRound(h)
+    expect(h.receive).not.toHaveBeenCalled()
+    expect(h.store.get(KV.gitlab.sinceEvents)).toBe('5')
+    expect(reads.filter(path => path.startsWith('events?action=pushed&sort=asc'))).toHaveLength(0)
+    h.store.close()
+  })
+
+  it('advances the cursor while the switch is off without producing Triggers, then takes in default-branch pushes', async () => {
+    const h = host()
+    h.store.saveSettings(pushSettings())
+    h.store.set(KV.gitlab.sinceEvents, '1')
+    const off = host(); off.store.set(KV.gitlab.sinceEvents, '1')
+    gitlab(off, { issues: () => [], merge_requests: () => [], events: () => [event(2), event(3)] })
+    await pollRound(off)
+    expect(off.receive).not.toHaveBeenCalled()
+    expect(off.store.get(KV.gitlab.sinceEvents)).toBe('3')
+    off.store.close()
+    // With the switch on, a push to the default branch by someone else becomes one Trigger listing the commits.
+    gitlab(h, { ...pushRoutes(), events: () => [event(2)] })
+    await pollRound(h)
+    expect(h.receive).toHaveBeenCalledTimes(1)
+    expect(h.receive.mock.calls[0]![0]).toMatchObject({
+      id: key('gitlab-push', '2'), actor: { id: 'carol' }, human: true,
+      threads: [{ source: SOURCE, id: `commit:${sha}` }],
+      text: `carol pushed 2 commit(s) to main\nb1b2b3b One`,
+      url: `${BASE}/-/compare/${'a'.repeat(40)}...${sha}`,
+      channel: { source: SOURCE, thread: `gitlab:commit:${sha}`, address: { target: 'commit', sha, url: `${BASE}/-/compare/${'a'.repeat(40)}...${sha}` } },
+      meta: { target: 'commit', kind: 'push', sha, before: 'a'.repeat(40), ref: 'main', count: 2 } })
+    expect(h.store.get(KV.gitlab.sinceEvents)).toBe('2')
+    h.store.close()
+  })
+
+  it('reads pushes newest first and stops at the cursor instead of reading the whole history', async () => {
+    const h = host()
+    h.store.saveSettings(pushSettings())
+    h.store.set(KV.gitlab.sinceEvents, '150')
+    // A full page, newest first, that already reaches the cursor: the next page is never requested.
+    const page = Array.from({ length: 100 }, (_, index) => event(200 - index, { push_data: { commit_count: 1, action: 'pushed',
+      ref_type: 'branch', commit_from: null, commit_to: sha, ref: 'dev' } }))
+    const reads = gitlab(h, { issues: () => [], merge_requests: () => [], events: () => page })
+    await pollRound(h)
+    const eventReads = reads.filter(path => path.startsWith('events?'))
+    expect(eventReads).toEqual(['events?action=pushed&sort=desc&per_page=100&page=1'])
+    expect(h.store.get(KV.gitlab.sinceEvents)).toBe('200')
+    h.store.close()
+  })
+
+  it('keeps other branches, the agent itself, and pushes a merged MR produced, and names a new branch by its single commit', async () => {
+    const h = host()
+    h.store.saveSettings(pushSettings())
+    h.store.set(KV.gitlab.sinceEvents, '1')
+    const commit = { id: 'c'.repeat(40), short_id: 'c1c2c3c', title: 'First', message: 'First\n\nbody', author_name: 'carol',
+      created_at: at(-10), web_url: `${BASE}/-/commit/${'c'.repeat(40)}`, parent_ids: [] }
+    gitlab(h, { issues: () => [], merge_requests: () => [], events: () => [
+        event(2, { push_data: { commit_count: 1, action: 'pushed', ref_type: 'branch', commit_from: null, commit_to: sha, ref: 'main' } }),
+        // Another branch, the agent itself, and a push a merged merge request produced.
+        event(3, { push_data: { commit_count: 1, action: 'pushed', ref_type: 'branch', commit_from: null, commit_to: sha, ref: 'dev' } }),
+        event(4, { author: author('agent-bot'), author_username: 'agent-bot',
+          push_data: { commit_count: 1, action: 'pushed', ref_type: 'branch', commit_from: null, commit_to: sha, ref: 'main' } }),
+      ],
+      [`repository/commits/${sha}/merge_requests`]: () => [],
+      [`repository/commits/${sha}`]: () => commit,
+      [`repository/commits/${'c'.repeat(40)}/merge_requests`]: () => [{ iid: 9, state: 'merged' }],
+    })
+    await pollRound(h)
+    expect(h.receive).toHaveBeenCalledTimes(1)
+    expect(h.receive.mock.calls[0]![0]).toMatchObject({ text: `carol pushed 1 commit(s) to main\nc1c2c3c First`,
+      url: `${BASE}/-/commit/${sha}`, meta: { before: null } })
+    h.store.close()
+  })
+
+  it('posts commit comments idempotently, answers gone on a 404, and links a commit channel', async () => {
+    const h = host()
+    const message = { id: 'r1', channel: { source: SOURCE, thread: `gitlab:commit:${sha}`, address: { target: 'commit', sha,
+      url: `${BASE}/-/commit/${sha}` } }, text: 'I pushed a fix for this', kind: 'reply' } as const
+    const posted: string[] = []
+    const paths: string[] = []
+    vi.spyOn(h.commands, 'withSignal').mockReturnValue(h.commands)
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+      const path = args[1]!
+      paths.push(path)
+      if (path.includes('/comments') && args.includes('POST')) { posted.push(args.find(a => String(a).startsWith('note='))!.slice(5)); return '{}' }
+      if (path.includes('/comments')) return JSON.stringify([])
+      throw notFound()
+    })
+    expect(await sendGitlab(h, message)).toBe('sent')
+    expect(posted).toEqual(['I pushed a fix for this\n\n<!-- dsh-superagent:r1 -->'])
+    expect(paths.at(-1)).toContain(`repository/commits/${sha}/comments`)
+    // An agent comment already carrying the marker sends nothing again.
+    vi.spyOn(h.commands, 'run').mockImplementation(async () => JSON.stringify([
+      { note: 'I pushed a fix for this\n\n<!-- dsh-superagent:r1 -->', author: author('agent-bot'), created_at: at(-5) }]))
+    expect(await sendGitlab(h, message)).toBe('sent')
+    // A deleted commit is gone.
+    vi.spyOn(h.commands, 'run').mockRejectedValue(notFound())
+    expect(await sendGitlab(h, message)).toBe('gone')
+    h.store.close()
+    expect(gitlabKind.channel!.link({ target: 'commit', sha, url: `${BASE}/-/commit/${sha}` }, {}))
+      .toEqual({ url: `${BASE}/-/commit/${sha}`, label: { zh: `GitLab commit ${sha.slice(0, 8)}`, en: `GitLab commit ${sha.slice(0, 8)}` } })
+  })
+
+  it('fills the push environment variables and finds a commit by its full hash', () => {
+    const config = gitlabKind.schema.parse({ observePushes: true })
+    expect(gitlabKind.scope!({ meta: { kind: 'push' } }, config)).toEqual({ listened: true, observed: true, row: 'pushes' })
+    expect(gitlabKind.scope!({ meta: { kind: 'push' } }, gitlabKind.schema.parse({}))).toMatchObject({ observed: false })
+    const rows = gitlabKind.policy!.rows!(gitlabKind.schema.parse({}))
+    expect(rows.map(row => row.id)).toEqual(['issues', 'mrs', 'comments', 'pushes'])
+    expect(rows[3]!.cells).toEqual({ listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: false })
+    const values = gitlabKind.environment!.values({ deployment: testDeployment({ gitlab: AGENT }), config,
+      trigger: ({ source: SOURCE, meta: { target: 'commit', sha: 'b'.repeat(40), before: 'a'.repeat(40) } }) as unknown as Trigger })
+    expect(values).toMatchObject({ DSH_SUPERAGENT_GITLAB_COMMIT: 'b'.repeat(40), DSH_SUPERAGENT_GITLAB_BEFORE: 'a'.repeat(40) })
+    expect(gitlabKind.find!('b'.repeat(40))).toEqual({ threads: [`gitlab:commit:${'b'.repeat(40)}`], terms: [] })
+  })
+})
+
+describe('gitlab reads', () => {
+  const sha = 'c'.repeat(40)
+  it('reads issues, merge requests, diffs, commits, and comparisons as model-facing records', async () => {
+    const h = host()
+    gitlab(h, {
+      'issues/12': () => issue(12),
+      'issues/12/discussions': () => [discussion('d1', [note(1, { body: 'looks wrong',
+        position: { new_path: 'src/a.ts', new_line: 3, old_path: null, old_line: null } }), note(2, { system: true, body: 'changed' })])],
+      'merge_requests/34': () => ({ ...issue(34, { web_url: `${BASE}/-/merge_requests/34` }), source_branch: 'fix', target_branch: 'main',
+        draft: true, state: 'opened' }),
+      'merge_requests/34/discussions': () => [discussion('d1', [note(3, { body: 'one more' })])],
+      'merge_requests/34/diffs': () => [{ old_path: 'src/a.ts', new_path: 'src/a.ts', diff: '@@ -1 +1 @@', new_file: false,
+        deleted_file: false, renamed_file: false }],
+      [`repository/commits/${sha}`]: () => ({ id: sha, short_id: 'c1c2c3c', title: 'One', message: 'One\n\nbody', author_name: 'carol',
+        created_at: at(-10), web_url: `${BASE}/-/commit/${sha}`, parent_ids: [] }),
+      [`repository/commits/${sha}/diff`]: () => [{ old_path: 'src/a.ts', new_path: 'src/a.ts', diff: '@@ -1 +1 @@' }],
+      'repository/compare': () => ({ commits: [{ id: sha, short_id: 'c1c2c3c', title: 'One', author_name: 'carol', created_at: at(-10) }],
+        diffs: [{ old_path: 'src/a.ts', new_path: 'src/a.ts', diff: '@@ -1 +1 @@' }] }),
+    })
+    expect(await readGitlab(h.commands, 'gitlab/issues/12')).toMatchObject({ iid: 12, title: 'Fix the margin', state: 'opened',
+      description: 'It is off', comments: [{ id: 1, discussion_id: 'd1', path: 'src/a.ts', line: 3, text: 'looks wrong' }] })
+    expect(await readGitlab(h.commands, 'gitlab/merge_requests/34')).toMatchObject({ iid: 34, source_branch: 'fix',
+      target_branch: 'main', draft: true, comments: [{ text: 'one more' }] })
+    expect(await readGitlab(h.commands, 'gitlab/merge_requests/34/diffs')).toMatchObject({ iid: 34,
+      diffs: [{ new_path: 'src/a.ts', diff: '@@ -1 +1 @@' }] })
+    expect(await readGitlab(h.commands, `gitlab/commits/${sha}`)).toMatchObject({ short_id: 'c1c2c3c', title: 'One',
+      diffs: [{ new_path: 'src/a.ts' }] })
+    expect(await readGitlab(h.commands, `gitlab/compare/${'a'.repeat(40)}...${sha}`)).toMatchObject({ commits: [{ short_id: 'c1c2c3c' }],
+      diffs: [{ new_path: 'src/a.ts' }] })
+    await expect(readGitlab(h.commands, 'gitlab/nope')).rejects.toThrow()
+    h.store.close()
+  })
+
+  it('reads a repository file and a directory listing from the default branch', async () => {
+    const h = host()
+    // A raw file comes back as the file's text, not JSON.
+    vi.spyOn(h.commands, 'withSignal').mockReturnValue(h.commands)
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+      const path = args[1]!.replace(/^projects\/451\//, '')
+      if (path.startsWith('repository/files/')) return '# hello'
+      if (path.startsWith('repository/tree')) return JSON.stringify([{ name: 'src', type: 'tree', path: 'src' },
+        { name: 'README.md', type: 'blob', path: 'README.md' }, { name: '.hidden', type: 'blob', path: '.hidden' }])
+      throw notFound()
+    })
+    expect(await readGitlabRepositoryPath(h.commands, AGENT, 'src/README.md', 'file')).toBe('# hello')
+    expect(await readGitlabRepositoryPath(h.commands, AGENT, 'src', 'directory')).toBe('README.md\nsrc/')
+    await expect(readGitlabRepositoryPath(h.commands, AGENT, '../etc', 'file')).rejects.toThrow()
+    h.store.close()
+  })
+
+  it('gives a commit Trigger its commit and comments as context, and references `!12` MR tickets', async () => {
+    const h = host()
+    const commitSha = 'd'.repeat(40)
+    gitlab(h, {
+      [`repository/commits/${commitSha}`]: () => ({ id: commitSha, short_id: 'd1d2d3d', title: 'One', message: 'One\n\nbody',
+        author_name: 'carol', created_at: at(-10), web_url: `${BASE}/-/commit/${commitSha}`, parent_ids: [] }),
+      [`repository/commits/${commitSha}/comments`]: () => [{ note: 'please split', author: author('carol'), created_at: at(-5) }],
+    })
+    const trigger = { source: SOURCE, url: `${BASE}/-/commit/${commitSha}`, at: at(-10),
+      meta: { target: 'commit', kind: 'push', sha: commitSha } } as never
+    const context = gitlabKind.threadContext!
+    const read = await context.read(h.commands, trigger, 'thread', undefined, gitlabKind.schema.parse({}))
+    expect(read.messages).toEqual([expect.objectContaining({ id: `${BASE}/-/commit/${commitSha}`, from: 'carol' }),
+      expect.objectContaining({ from: 'carol', text: 'please split' })])
+    // A commit Thread's root and parent are its commit followed by its comments.
+    const ids = read.messages.map(message => message.id)
+    expect((await context.read(h.commands, trigger, 'root', undefined, gitlabKind.schema.parse({}))).messages.map(m => m.id))
+      .toEqual(ids)
+    expect((await context.read(h.commands, trigger, 'parent', undefined, gitlabKind.schema.parse({}))).messages.map(m => m.id))
+      .toEqual(ids)
+    // `!34` in a candidate's text names the merge request's Thread and its tickets.
+    h.store.threads.save({ key: 'gitlab:mr:34', ref: { source: SOURCE, id: 'mr:34' }, createdAt: at(-60), lastAt: at(-60),
+      subscriptions: ['t1'], correlated: [], pending: [], meta: {} })
+    h.store.tickets.save({ id: 't1', title: 'one', decisionId: 'd1', mandate: { strength: 'explicit', policyVersion: '',
+      basis: { via: 'listed' }, actor: { source: 'gitlab', id: 'carol' }, scope: '' }, channels: [], assignments: [], inputs: [],
+      undelivered: [], createdAt: '', updatedAt: '', origin: { triggerId: 'x', triggerIds: [] } } as Ticket)
+    const primary = issueTrigger(issue(50, { description: 'see !34' }), AGENT)
+    h.store.triggers.save(primary)
+    const candidate = { evalId: 'e1', strength: 'inferred' as const, triggers: [primary], tickets: [], policyVersion: '' }
+    const card = await candidateCard({ store: h.store, links: new TextCache(1000), commands: h.commands, sources: h.sources,
+      lifetime: new AbortController().signal }, candidate as never)
+    expect(card).toMatchObject({ referenced_tickets: [{ ticket_id: 't1' }] })
+    h.store.close()
   })
 })

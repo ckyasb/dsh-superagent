@@ -3,11 +3,14 @@ import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import type { Thread } from '../core/index.ts'
 import { GitlabAccountsSchema, type GitlabAccount } from '../deployment.ts'
-import type { Tally } from '../infra/commands.ts'
+import { validItems, type Tally } from '../infra/commands.ts'
 import { gitlabLink, sendGitlab } from './gitlab-channel.ts'
 import { gitlabThreadContext } from './gitlab-read.ts'
-import { DiscussionSchema, IssueSchema, MergeRequestSchema, SOURCE, discussionNotes, isSelf, issueTrigger, mentions,
-  mergeRequestTrigger, noteTrigger, threadId, threadKey, type GitlabIssue, type GitlabMergeRequest, type GitlabNote } from './gitlab-trigger.ts'
+import { observeMergeRequest, mergeRequestsOf, readMergeRequest } from './gitlab-mr.ts'
+import { CommitSchema, DiscussionSchema, EventSchema, IssueSchema, MergeRequestSchema, SOURCE, commitThreadKey, isSelf, issueTrigger, mentions,
+  mergeRequestTrigger, noCommit, noteTrigger, pushTrigger, threadId, threadKey, type GitlabCommit, type GitlabEvent, type GitlabIssue,
+  type GitlabMergeRequest, type GitlabNote, type GitlabPushData } from './gitlab-trigger.ts'
+import { discussionNotes } from './gitlab-trigger.ts'
 import { health, sourceContext, type Health, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
 import { cursorAt, pause, pollFailure, pollThreads as pollEach } from './poll.ts'
@@ -17,13 +20,15 @@ export { issueTrigger, mergeRequestTrigger, noteTrigger, SOURCE } from './gitlab
 
 const GitlabConfigSchema = GitlabAccountsSchema.extend({ pollSeconds: z.number().int().min(30).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
-  observeIssues: z.boolean().default(false), observeMergeRequests: z.boolean().default(false), observeComments: z.boolean().default(false) }).strict()
+  observeIssues: z.boolean().default(false), observeMergeRequests: z.boolean().default(false), observeComments: z.boolean().default(false),
+  observePushes: z.boolean().default(false) }).strict()
 export type GitlabConfig = z.infer<typeof GitlabConfigSchema>
-const OBSERVED = { issues: 'observeIssues', mrs: 'observeMergeRequests', comments: 'observeComments' } as const
+const OBSERVED = { issues: 'observeIssues', mrs: 'observeMergeRequests', comments: 'observeComments', pushes: 'observePushes' } as const
 type Scope = keyof typeof OBSERVED
 function scopeOf(meta: Record<string, unknown>): Scope | undefined {
   if (meta.kind === 'issue') return 'issues'
   if (meta.kind === 'mr') return 'mrs'
+  if (meta.kind === 'push') return 'pushes'
   return meta.kind === 'note' ? 'comments' : undefined
 }
 export const gitlabKind: SourceKind<GitlabConfig> = {
@@ -45,7 +50,9 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
     { key: 'observeMergeRequests', type: 'switch', label: { zh: '接收项目里的新合并请求', en: 'Receive new merge requests in the project' },
       hint: { zh: '打开后，没有 @ 智能体的新合并请求也会收到，由策略的接收表决定是否成为候选。', en: 'New merge requests that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
     { key: 'observeComments', type: 'switch', label: { zh: '接收项目里的评论', en: 'Receive comments in the project' },
-      hint: { zh: '打开后，Issue 和合并请求上没有 @ 智能体的评论也会收到，由策略的接收表决定是否成为候选。', en: 'Comments on Issues and merge requests that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } }],
+      hint: { zh: '打开后，Issue 和合并请求上没有 @ 智能体的评论也会收到，由策略的接收表决定是否成为候选。', en: 'Comments on Issues and merge requests that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
+    { key: 'observePushes', type: 'switch', label: { zh: '接收默认分支的推送', en: 'Receive pushes to the default branch' },
+      hint: { zh: '打开后，有人直接推到默认分支时收到一条，由策略的接收表决定是否成为候选；通过合并请求合入的提交不算（它们已在合并请求里）。', en: 'When someone pushes straight to the default branch, one event is received, and the Policy\'s admission table decides whether it becomes a candidate. Commits merged through a merge request do not count; they are already in the merge request.' } }],
   scope: ({ meta }, config) => {
     const row = scopeOf(meta)
     return { listened: true, observed: row !== undefined && config[OBSERVED[row]], ...row ? { row } : {} }
@@ -53,16 +60,18 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
   health: ['gitlab'],
   channel: { send: sendGitlab, link: gitlabLink },
   threadContext: gitlabThreadContext,
-  // `#12` names Issue 12, `!34` names merge request 34, and a bare number is ambiguous because the two sequences are independent.
+  // `#12` names Issue 12, `!34` names merge request 34, a 40-digit commit hash names a commit, and a bare number is ambiguous because the two sequences are independent.
   find: query => {
     const text = query.trim()
     const threads = new Set<string>()
     const issue = /^#(\d+)$/.exec(text)?.[1] ?? /\/-\/issues\/(\d+)/.exec(query)?.[1]
     const mr = /^!(\d+)$/.exec(text)?.[1] ?? /\/-\/merge_requests\/(\d+)/.exec(query)?.[1]
     const plain = /^(\d+)$/.exec(text)?.[1]
+    const commit = /^([0-9a-f]{40})$/i.exec(text)?.[1]
     if (issue) threads.add(threadKey('issue', Number(issue)))
     if (mr) threads.add(threadKey('mr', Number(mr)))
     if (plain) { threads.add(threadKey('issue', Number(plain))); threads.add(threadKey('mr', Number(plain))) }
+    if (commit) threads.add(commitThreadKey(commit.toLowerCase()))
     return { threads: [...threads], terms: [] }
   },
   policy: {
@@ -80,7 +89,11 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
       const row = (id: Scope, label: { zh: string; en: string }) => ({ id, label, note: note(config[OBSERVED[id]]),
         cells: { listedUnaddressed: !!config[OBSERVED[id]], unlistedAddressed: true, unlistedUnaddressed: !!config[OBSERVED[id]] } })
       return [row('issues', { zh: '新 Issue', en: 'New Issues' }), row('mrs', { zh: '新合并请求', en: 'New merge requests' }),
-        row('comments', { zh: '评论', en: 'Comments' })]
+        row('comments', { zh: '评论', en: 'Comments' }),
+        // A push never mentions anyone, so only the cells of a sender off the list who does not address the agent apply.
+        { id: 'pushes', label: { zh: '默认分支的推送', en: 'Default branch pushes' },
+          note: config.observePushes ? { zh: '接收', en: 'Received' } : { zh: '不接收', en: 'Not received' },
+          cells: { listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: !!config.observePushes } }]
     },
   },
   environment: {
@@ -95,6 +108,8 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
       { key: 'DSH_SUPERAGENT_GITLAB_ISSUE_IID', description: { zh: '接下工单的 Issue 的 iid；工单不是从 Issue 来的时为空', en: 'The iid of the Issue that started the ticket; empty when it did not start on an Issue' } },
       { key: 'DSH_SUPERAGENT_GITLAB_MR_IID', description: { zh: '接下工单的合并请求的 iid；工单不是从合并请求来的时为空', en: 'The iid of the merge request that started the ticket; empty when it did not start on one' } },
       { key: 'DSH_SUPERAGENT_GITLAB_MR_HEAD', description: { zh: '接下工单的合并请求的 head 引用 refs/merge-requests/<iid>/head；不是合并请求时为空', en: 'Head ref refs/merge-requests/<iid>/head of the merge request that started the ticket; empty when it was not one' } },
+      { key: 'DSH_SUPERAGENT_GITLAB_COMMIT', description: { zh: '工单起源于默认分支推送时的提交哈希；不是推送来的时为空', en: 'The commit hash when the ticket started on a push to the default branch; empty when it did not start on one' } },
+      { key: 'DSH_SUPERAGENT_GITLAB_BEFORE', description: { zh: '该推送之前的提交哈希；新分支的第一次推送或不是推送来的时为空', en: 'The commit hash before that push; empty for a new branch\'s first push and when it did not start on one' } },
     ],
     values: ({ deployment, trigger }) => {
       const { gitlab } = deployment
@@ -102,11 +117,14 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
       const iid = Number(origin?.meta.iid) || 0
       const onIssue = origin?.meta.target === 'issue' && iid > 0
       const onMr = origin?.meta.target === 'mr' && iid > 0
+      const onPush = origin?.meta.target === 'commit'
       return { DSH_SUPERAGENT_GITLAB_HOST: gitlab?.host ?? '', DSH_SUPERAGENT_GITLAB_PROJECT: gitlab?.project ?? '',
         DSH_SUPERAGENT_GITLAB_PROJECT_ID: gitlab ? String(gitlab.projectId) : '', DSH_SUPERAGENT_GITLAB_WEB_URL: gitlab?.webUrl ?? '',
         DSH_SUPERAGENT_GITLAB_DEFAULT_BRANCH: gitlab?.defaultBranch ?? '', DSH_SUPERAGENT_GITLAB_ACCOUNT: gitlab?.login ?? '',
         DSH_SUPERAGENT_GITLAB_COMMIT_EMAIL: gitlab?.commitEmail ?? '', DSH_SUPERAGENT_GITLAB_ISSUE_IID: onIssue ? String(iid) : '',
-        DSH_SUPERAGENT_GITLAB_MR_IID: onMr ? String(iid) : '', DSH_SUPERAGENT_GITLAB_MR_HEAD: onMr ? `refs/merge-requests/${iid}/head` : '' }
+        DSH_SUPERAGENT_GITLAB_MR_IID: onMr ? String(iid) : '', DSH_SUPERAGENT_GITLAB_MR_HEAD: onMr ? `refs/merge-requests/${iid}/head` : '',
+        DSH_SUPERAGENT_GITLAB_COMMIT: onPush && typeof origin?.meta.sha === 'string' ? origin.meta.sha : '',
+        DSH_SUPERAGENT_GITLAB_BEFORE: onPush && typeof origin?.meta.before === 'string' ? origin.meta.before : '' }
     },
   },
   facts: (deployment): Record<string, Localized | string> => deployment?.gitlab ? {
@@ -164,6 +182,8 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   const commands = ctx.commands.withSignal(round.signal)
   await pollStream(ctx, commands, round, 'issues', config).catch(error => { if (!stopped(ctx, round)) round.failures.push(`issues: ${String(error)}`) })
   await pollStream(ctx, commands, round, 'mrs', config).catch(error => { if (!stopped(ctx, round)) round.failures.push(`merge requests: ${String(error)}`) })
+  await pollPushes(ctx, commands, round, config).catch(error => { if (!stopped(ctx, round)) round.failures.push(`pushes: ${String(error)}`) })
+  await pollTicketMergeRequests(ctx, round)
   await pollSubscribed(ctx, round)
   if (signal?.aborted) return config.pollSeconds
   if (round.failures.length) throw new Error(`${round.failures.length} GitLab reads failed: ${round.failures.slice(0, 3).join('; ')}`)
@@ -189,8 +209,11 @@ async function pollStream(ctx: SourceContext, commands: ReturnType<SourceContext
     if (stopped(ctx, round)) throw new Error('The GitLab Source stopped during the poll')
     const target = stream === 'issues' ? 'issue' as const : 'mr' as const
     const iid = item.iid
+    const key = threadKey(target, iid)
+    round.read.add(key)
     const opened = Date.parse(item.created_at) >= Date.parse(since) && !isSelf(item.author, account)
     // A description reaches the gate when it mentions the agent, or when the stream is observed in full.
+    if (target === 'mr') await observeMergeRequest(ctx, { ...item as GitlabMergeRequest, iid, source_branch: (item as GitlabMergeRequest).source_branch ?? '' })
     if (opened && (mentions(item.description ?? '', account.login) || (stream === 'issues' ? config.observeIssues : config.observeMergeRequests))) {
       await ctx.receive(stream === 'issues' ? issueTrigger(item, account) : mergeRequestTrigger(item, account))
     }
@@ -247,7 +270,79 @@ async function pollThread(ctx: SourceContext, round: Round, thread: Thread, conf
   await readComments(ctx, commands, round, account, { target, iid,
     ...target === 'mr' ? { mrAuthor: typeof thread.meta.mrAuthor === 'string' ? thread.meta.mrAuthor : undefined } : {} },
     ctx.state.get(checkpoint) ?? thread.createdAt, config)
-  ctx.state.set(checkpoint, cursorAt(round.started))
+  // Never move the Thread cursor backwards: `readComments` may already have stepped it past this round's overlap.
+  const mark = cursorAt(round.started)
+  const held = ctx.state.get(checkpoint)
+  if (!held || Date.parse(mark) > Date.parse(held)) ctx.state.set(checkpoint, mark)
+}
+/** Reads the commits a push moved, from the comparison, or from the single commit of a new branch. */
+async function pushCommits(commands: ReturnType<SourceContext['commands']['withSignal']>, push: GitlabPushData): Promise<GitlabCommit[]> {
+  const to = push.commit_to ?? ''
+  if (noCommit(push.commit_from)) {
+    const commit = await commands.gitlabApi(CommitSchema, `repository/commits/${encodeURIComponent(to)}`)
+    return [commit]
+  }
+  const compared = await commands.gitlabApi(z.looseObject({ commits: z.array(CommitSchema).nullish() }),
+    `repository/compare?from=${encodeURIComponent(push.commit_from!)}&to=${encodeURIComponent(to)}`)
+  return compared.commits ?? []
+}
+/** True when a push's commit arrived through a merged merge request, which its own MR stream already reported. */
+async function viaMergeRequest(commands: ReturnType<SourceContext['commands']['withSignal']>, sha: string): Promise<boolean> {
+  const listed = await commands.gitlabApi(z.array(z.looseObject({ iid: z.number(), state: z.string() })),
+    `repository/commits/${encodeURIComponent(sha)}/merge_requests`)
+  return listed.some(mr => mr.state === 'merged')
+}
+/**
+ * Reads the push-event stream since its cursor. The first round only records the newest event's id as the starting point.
+ * Every round advances the cursor, switch on or off, so switching on never replays old pushes; with the switch on, a push
+ * to the default branch that was not the agent's and did not arrive through a merged merge request becomes a Trigger.
+ */
+async function pollPushes(ctx: SourceContext, commands: ReturnType<SourceContext['commands']['withSignal']>, round: Round,
+  config: GitlabConfig): Promise<void> {
+  const account = ctx.deployment.gitlab!
+  const cursor = ctx.state.get(KV.gitlab.sinceEvents)
+  if (cursor === undefined) {
+    const [newest] = await commands.gitlabApi(z.array(EventSchema), 'events?action=pushed&sort=desc&per_page=1')
+    ctx.state.set(KV.gitlab.sinceEvents, String(newest?.id ?? 0))
+    return
+  }
+  // Newest first, page by page, until a page reaches the cursor, so a round never reads the project's whole push history
+  // (which, oldest first and capped at 50 pages, would also never reach the newest pushes of a busy project).
+  const fresh: GitlabEvent[] = []
+  for (let page = 1; page <= 50; page += 1) {
+    const listed = await commands.gitlabApi(z.array(z.unknown()), `events?action=pushed&sort=desc&per_page=100&page=${page}`)
+    const events = validItems(EventSchema, listed, round.tally)
+    fresh.push(...events.filter(event => event.id > Number(cursor)))
+    if (listed.length < 100 || events.some(event => event.id <= Number(cursor))) break
+  }
+  fresh.sort((a, b) => a.id - b.id)
+  let newest = Number(cursor)
+  for (const event of fresh) {
+    newest = Math.max(newest, event.id)
+    if (stopped(ctx, round)) throw new Error('The GitLab Source stopped during the poll')
+    if (!config.observePushes) continue
+    const push = event.push_data
+    if (!push || push.action !== 'pushed' || push.ref_type !== 'branch' || !push.commit_to
+      || push.ref !== account.defaultBranch || isSelf(event.author ?? { id: 0, username: event.author_username ?? '' }, account)) continue
+    if (await viaMergeRequest(commands, push.commit_to)) continue
+    const commits = await pushCommits(commands, push)
+    await ctx.receive(pushTrigger(event, account, commits, account.webUrl))
+    ctx.threads.describe(commitThreadKey(push.commit_to), { label: `Commit ${push.commit_to.slice(0, 8)}`,
+      facts: { branch: { value: push.ref ?? '' } } })
+  }
+  if (newest > Number(cursor)) ctx.state.set(KV.gitlab.sinceEvents, String(newest))
+}
+/** Reads and observes the open MRs of open tickets that the streams did not already read this round, so their merge or close is never missed. */
+async function pollTicketMergeRequests(ctx: SourceContext, round: Round): Promise<void> {
+  const iids = [...new Set(ctx.tickets.open().flatMap(ticket => mergeRequestsOf(ticket, true)))]
+  for (const iid of iids) {
+    if (stopped(ctx, round)) return
+    const key = threadKey('mr', iid)
+    if (round.read.has(key)) continue
+    round.read.add(key)
+    try { await observeMergeRequest(ctx, await readMergeRequest(ctx, iid, round.signal)) }
+    catch (error) { if (!stopped(ctx, round)) round.failures.push(`!${iid}: ${String(error)}`) }
+  }
 }
 /** Names a Thread after its Issue or merge request, with the item's state as a fact. */
 function describe(ctx: SourceContext, target: 'issue' | 'mr', iid: number, title: string, state: string): void {

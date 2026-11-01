@@ -55,7 +55,8 @@ export const KV = {
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },
-  /** GitLab Source: per-stream cursors for the Issue and merge-request feeds, and per-Issue/merge-request comment cursors. */
+  /** GitLab Source: per-stream cursors for the Issue and merge-request feeds and the push-event feed, and per-Issue/merge-request comment cursors. */
   gitlab: { sinceIssues: record<string>('gitlab-since:issues'), sinceMrs: record<string>('gitlab-since:mrs'),
+    sinceEvents: record<string>('gitlab-since:events'),
     cursor: family<string, [target: 'issue' | 'mr', iid: number]>('gitlab-cursor:') },
 }

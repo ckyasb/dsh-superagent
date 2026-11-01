@@ -37,6 +37,53 @@ export type GitlabMergeRequest = z.infer<typeof MergeRequestSchema>
 /** The body of the description part of an Issue or merge request, as both APIs return it. */
 export const Description = z.looseObject({ title: z.string(), description: z.string().nullish(), author: z.looseObject({ username: z.string() }),
   created_at: z.string(), web_url: z.string() })
+/** A commit as `repository/commits/<sha>` and `repository/compare` return it. */
+export const CommitSchema = z.looseObject({ id: z.string(), short_id: z.string(), title: z.string(), message: z.string().nullish(),
+  author_name: z.string().nullish(), created_at: z.string().nullish(), web_url: z.string().nullish(), parent_ids: z.array(z.string()).nullish() })
+export type GitlabCommit = z.infer<typeof CommitSchema>
+/** A file change as the diffs of a merge request, a commit, or a comparison return it. */
+export const DiffSchema = z.looseObject({ old_path: z.string(), new_path: z.string(), diff: z.string().nullish(), new_file: z.boolean().nullish(),
+  deleted_file: z.boolean().nullish(), renamed_file: z.boolean().nullish() })
+export type GitlabDiff = z.infer<typeof DiffSchema>
+/** A comparison of two commits: its commits and their combined diff. */
+export const CompareSchema = z.looseObject({ commits: z.array(CommitSchema).nullish(), diffs: z.array(DiffSchema).nullish() })
+export type GitlabCompare = z.infer<typeof CompareSchema>
+/** A comment on a single commit; a commit comment carries no id, so its position in the list stands in for one. */
+export const CommitCommentSchema = z.looseObject({ note: z.string().nullish(), author: UserSchema.nullish(), created_at: z.string().nullish() })
+export type GitlabCommitComment = z.infer<typeof CommitCommentSchema>
+/** The push payload of a project event. */
+export const PushDataSchema = z.looseObject({ commit_count: z.number().nullish(), action: z.string().nullish(), ref_type: z.string().nullish(),
+  commit_from: z.string().nullish(), commit_to: z.string().nullish(), ref: z.string().nullish(), commit_title: z.string().nullish() })
+export type GitlabPushData = z.infer<typeof PushDataSchema>
+/** A project event as `events?action=pushed` returns it. */
+export const EventSchema = z.looseObject({ id: z.number(), action_name: z.string().nullish(), author: UserSchema.nullish(),
+  author_username: z.string().nullish(), created_at: z.string(), push_data: PushDataSchema.nullish() })
+export type GitlabEvent = z.infer<typeof EventSchema>
+/** The Thread key of one commit, and the ref a commit Thread binds with. */
+export const commitThreadKey = (sha: string): string => `${SOURCE}:commit:${sha}`
+/** True when a commit `from` is absent or GitLab's all-zero "no parent" value. */
+export const noCommit = (sha: string | null | undefined): boolean => !sha || /^0{40}$/.test(sha) || /^0+$/.test(sha)
+/**
+ * Builds the trigger for a push to the default branch; `commits` lists the pushed commits in order (one entry for a new
+ * branch's single commit). Pushes have no person to mention, so they carry no `addressed`.
+ */
+export function pushTrigger(event: GitlabEvent, agent: GitlabAccount, commits: Pick<GitlabCommit, 'short_id' | 'title'>[],
+  webUrl: string): Trigger {
+  const push = event.push_data ?? {}
+  const sha = push.commit_to ?? ''
+  const before = push.commit_from ?? null
+  const from = noCommit(before) ? undefined : before!
+  const url = from ? `${webUrl.replace(/\/$/, '')}/-/compare/${from}...${sha}` : `${webUrl.replace(/\/$/, '')}/-/commit/${sha}`
+  const lines = commits.slice(0, 20).map(commit => `${commit.short_id} ${commit.title}`)
+  if (commits.length > 20) lines.push(`… and ${commits.length - 20} more`)
+  const author: GitlabUser = event.author ?? { id: 0, username: event.author_username ?? '' }
+  return { id: key('gitlab-push', String(event.id)), source: SOURCE,
+    threads: [{ source: SOURCE, id: `commit:${sha}` }], actor: { source: SOURCE, id: author.username },
+    human: isHumanAuthor(author, agent), at: event.created_at,
+    text: `${author.username} pushed ${push.commit_count ?? commits.length} commit(s) to ${push.ref ?? ''}\n${lines.join('\n')}`,
+    channel: { source: SOURCE, thread: commitThreadKey(sha), address: { target: 'commit', sha, url } }, url,
+    meta: { target: 'commit', kind: 'push', sha, before, ref: push.ref, count: push.commit_count } }
+}
 /** The non-system notes of one discussion, oldest first; system notes (label and description changes) never become Triggers. */
 export const discussionNotes = (discussion: GitlabDiscussion): GitlabNote[] => discussion.notes.filter(note => !note.system)
 /** True when a reply can join this discussion (GitLab sets `individual_note` on a single-note discussion that takes none). */
