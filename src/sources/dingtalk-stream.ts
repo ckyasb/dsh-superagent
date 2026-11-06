@@ -21,8 +21,10 @@ export const ROBOT_TOPIC = '/v1.0/im/bot/messages/get'
 /** Builds the real client through the official `dingtalk-stream` SDK, which maintains its own reconnection. */
 export const defaultClientFactory: DingtalkClientFactory = async credentials => {
   const { DWClient, TOPIC_ROBOT } = await import('dingtalk-stream')
-  // keepAlive pings the socket so a silently dropped connection is noticed; the SDK's automatic reconnect (on by default) re-opens it.
-  const client = new DWClient({ clientId: credentials.clientId, clientSecret: credentials.clientSecret, debug: false, keepAlive: true })
+  // keepAlive is off: its heartbeat timer pings sockets that are still connecting, and the SDK throws from that timer, which
+  // ends the whole process. Without it the SDK still reconnects when DingTalk closes the socket; a silently dropped socket
+  // is noticed when DingTalk next pushes or closes it.
+  const client = new DWClient({ clientId: credentials.clientId, clientSecret: credentials.clientSecret, debug: false, keepAlive: false })
   return {
     registerCallbackListener: (topic, callback) => { client.registerCallbackListener(topic || TOPIC_ROBOT, callback) },
     connect: () => client.connect(),
